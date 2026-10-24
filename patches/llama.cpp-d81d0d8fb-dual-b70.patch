@@ -1,0 +1,2231 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 5a0b5b512..68e38a7be 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -207,6 +207,9 @@ struct common_speculative_impl {
+ 
+     virtual bool process(const common_batch & batch) = 0;
+ 
++    // (optional) the last position the upcoming prompt reaches for seq_id
++    virtual void set_prompt_end(llama_seq_id /*seq_id*/, llama_pos /*pos_last*/) {}
++
+     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
+ 
+     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+@@ -1022,6 +1025,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
+     uint32_t        target_layer_ids_n = 0;
+ 
++    // LLAMA_DFLASH_PREFILL_TAIL=1: when every draft layer is sliding-window, prompt rows more than tail_keep positions
++    // before the prompt's last position are never attended by a draft, so process() skips them (0 = off)
++    int32_t                tail_keep = 0;
++    std::vector<llama_pos> prompt_last; // per seq, from set_prompt_end(); -1 = unknown
++
+     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
+             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
+         : common_speculative_impl(type, n_seq, params.draft.n_max)
+@@ -1072,6 +1080,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         }
+         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+ 
++        prompt_last.assign(n_seq, -1);
++        {
++            const char * env = getenv("LLAMA_DFLASH_PREFILL_TAIL");
++            const int32_t n_swa   = llama_model_n_swa(model_dft);
++            const bool    all_swa = llama_model_is_swa_all(model_dft);
++            if (env && std::atoi(env) != 0) {
++                if (all_swa) {
++                    // window + one block of drafted positions + margin
++                    tail_keep = n_swa + block_size + 64;
++                    LOG_WRN("%s: prefill tail: draft prompt rows older than %d positions before the prompt end are skipped "
++                            "(every draft layer sliding-window, n_swa = %d)\n", __func__, tail_keep, n_swa);
++                } else {
++                    LOG_WRN("%s: LLAMA_DFLASH_PREFILL_TAIL ignored: not every draft layer is sliding-window (n_swa = %d)\n",
++                            __func__, n_swa);
++                }
++            }
++        }
++
+         if (is_dspark && this->params.p_min > 0.0f) {
+             char buf[16] = {};
+             const bool has_conf =
+@@ -1188,6 +1214,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+         const int32_t n_tokens = batch_in.size();
+ 
++        // LLAMA_DFLASH_PROCESS_TIMING=1 (diagnostic): log the host gather and the (synchronized) draft decode per call
++        static const bool timing = getenv("LLAMA_DFLASH_PROCESS_TIMING") && atoi(getenv("LLAMA_DFLASH_PROCESS_TIMING")) != 0;
++        const int64_t t_call0 = ggml_time_us();
++        int64_t t_gather = 0, t_decode = 0;
++        // LLAMA_DFLASH_PROCESS_SKIP=1 (diagnostic only, drafts degrade): no draft prefill, to cost the target side alone
++        static const bool skip = getenv("LLAMA_DFLASH_PROCESS_SKIP") && atoi(getenv("LLAMA_DFLASH_PROCESS_SKIP")) != 0;
++        if (skip) {
++            return true;
++        }
++
+         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
+         std::vector<int32_t> i_batch_beg(n_seq, -1);
+         std::vector<int32_t> i_batch_end(n_seq, -1);
+@@ -1211,6 +1247,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             if (i_batch_beg[seq_id] < 0) {
+                 continue;
+             }
++            // prefill tail: rows the sliding-window draft can never attend are skipped (positions ascend within a seq)
++            if (tail_keep > 0 && prompt_last[seq_id] >= 0) {
++                const llama_pos keep_from = prompt_last[seq_id] - tail_keep;
++                int32_t b = i_batch_beg[seq_id];
++                while (b <= i_batch_end[seq_id] && batch_in.tokens[b].pos[0] < keep_from) {
++                    b++;
++                }
++                if (b > i_batch_end[seq_id]) {
++                    continue;
++                }
++                i_batch_beg[seq_id] = b;
++            }
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+ 
+             // an M-RoPE image pins all its rows to one position, so a windowed draft
+@@ -1225,6 +1273,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+                 // gather target features per extract layer; the fused decode encodes and
+                 // injects them into the K/V cache at the target positions
++                const int64_t t_g0 = ggml_time_us();
+                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+@@ -1244,7 +1293,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     const llama_pos pos_arr[4] = { p, p, p, 0 };
+                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                 }
++                const int64_t t_d0 = ggml_time_us();
++                t_gather += t_d0 - t_g0;
+                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
++                if (timing) {
++                    llama_synchronize(ctx_dft);
++                }
++                t_decode += ggml_time_us() - t_d0;
+                 if (rc != 0) {
+                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                             __func__, rc, (int) n_chunk, (int) offset);
+@@ -1271,9 +1326,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+         }
+ 
++        if (timing && n_tokens > 16) {
++            LOG_WRN("DFLASH_PROCESS tail_keep=%d prompt_last=%d first_pos=%d\n", tail_keep, (int) prompt_last[0],
++                    (int) batch_in.tokens[0].pos[0]);
++            LOG_WRN("DFLASH_PROCESS n_tokens=%d total=%.1f ms gather=%.1f ms draft_decode=%.1f ms\n", n_tokens,
++                    (ggml_time_us() - t_call0) / 1000.0, t_gather / 1000.0, t_decode / 1000.0);
++        }
+         return true;
+     }
+ 
++    void set_prompt_end(llama_seq_id seq_id, llama_pos pos_last) override {
++        if (seq_id >= 0 && seq_id < (llama_seq_id) prompt_last.size()) {
++            prompt_last[seq_id] = pos_last;
++        }
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
+@@ -2901,6 +2968,16 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+     }
+ }
+ 
++void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_last) {
++    if (spec == nullptr) {
++        return;
++    }
++
++    for (auto & impl : spec->impls) {
++        impl->set_prompt_end(seq_id, pos_last);
++    }
++}
++
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+     bool result = true;
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index a59846829..eb4099f77 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -86,6 +86,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
+ // optionally call once at the beginning of a new generation
+ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
+ 
++// optionally call before a prompt is processed: the last position the prompt will reach for seq_id
++// (lets a sliding-window draft skip prompt rows it can never attend)
++void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_last);
++
+ // process the batch and update the internal state of the speculative context
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+ 
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index c6f285f96..7da05fa28 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -448,6 +448,21 @@ struct ggml_backend_sycl_context {
+ 
+     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
+ 
++    // GGML_SYCL_SHARE_Q8_1: the last Q8_1-quantized src1 of ggml_sycl_op_mul_mat, reused by the next mul_mat that
++    // reads the same tensor with the same layout. Keyed per graph run (q8_share_epoch, bumped at each graph
++    // compute), since a tensor's contents are fixed once produced within one graph and the in-order queue orders
++    // any re-quantization after the earlier readers.
++    struct q8_share_key {
++        const ggml_tensor * src1     = nullptr;
++        const void *        data     = nullptr;
++        const void *        quant_fn = nullptr;
++        int64_t             ne10 = 0, nrows1 = 0, padded = 0;
++        uint64_t            epoch    = 0;
++    } q8_share;
++    char *   q8_share_buf   = nullptr;
++    size_t   q8_share_cap   = 0;
++    uint64_t q8_share_epoch = 1;
++
+     explicit ggml_backend_sycl_context(int device) :
+         device(device),
+         name(GGML_SYCL_NAME + std::to_string(device)) {
+@@ -509,6 +524,9 @@ struct ggml_backend_sycl_context {
+     dnnl::stream stream_dnnl() {
+         return stream_dnnl(device, 0);
+     }
++
++    // oneDNN SDPA partitions compiled for this context's engine (type-erased, see fattn-onednn.cpp)
++    std::unordered_map<std::string, std::shared_ptr<void>> onednn_sdpa_cache;
+ #endif
+ 
+     // pool
+diff --git a/ggml/src/ggml-sycl/dpct/helper.hpp b/ggml/src/ggml-sycl/dpct/helper.hpp
+index fd3b9655a..cc7987a46 100644
+--- a/ggml/src/ggml-sycl/dpct/helper.hpp
++++ b/ggml/src/ggml-sycl/dpct/helper.hpp
+@@ -17,8 +17,12 @@
+ #include <iostream>
+ #include <map>
+ 
++#include <mutex>
++#include <vector>
++
+ #include <sycl/sycl.hpp>
+ #include <sycl/half_type.hpp>
++#include <sycl/ext/oneapi/backend/level_zero.hpp>
+ #include <oneapi/mkl.hpp>
+ 
+ #if defined(__linux__)
+@@ -90,6 +94,49 @@ inline std::string get_device_backend_and_type(const sycl::device &device) {
+     return device_type.str();
+ }
+ 
++// GGML_SYCL_PER_DEVICE_CONTEXT=1: give every Level Zero GPU its own SYCL context, all wrapping the platform default
++// context's single native Level Zero context. Works around a DPC++ (oneAPI 2026.1) fast-kernel-cache leak: when one
++// kernel runs on two devices of the same SYCL context, every device switch misses the cache and saveKernel() appends
++// a (kernel name, device) record that is never freed (~170 B per launch; tensor parallel alternates devices thousands
++// of times per decode, 90+ GB host memory after a long session). One device per SYCL context means no misses. USM
++// stays shared at the Level Zero level, so host buffers allocated through one GPU's context still work on the other.
++inline sycl::context ggml_sycl_queue_context(const sycl::device & device) {
++    static const bool per_device = [] {
++        const char * e = std::getenv("GGML_SYCL_PER_DEVICE_CONTEXT");
++        return e != nullptr && std::atoi(e) != 0;
++    }();
++    const sycl::context shared = device.get_platform().khr_get_default_context();
++    if (!per_device || !device.is_gpu() || device.get_backend() != sycl::backend::ext_oneapi_level_zero) {
++        return shared;
++    }
++    static std::mutex mtx;
++    static std::vector<std::pair<sycl::device, sycl::context>> made;
++    std::lock_guard<std::mutex> lock(mtx);
++    for (const auto & [d, c] : made) {
++        if (d == device) {
++            return c;
++        }
++    }
++    const auto native = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(shared);
++    sycl::context ctx = sycl::make_context<sycl::backend::ext_oneapi_level_zero>(
++        sycl::backend_input_t<sycl::backend::ext_oneapi_level_zero, sycl::context>{
++            native, { device }, sycl::ext::oneapi::level_zero::ownership::keep });
++    made.emplace_back(device, ctx);
++    return ctx;
++}
++
++// two queues whose USM is mutually usable: the same SYCL context, or per-device contexts over one native L0 context
++inline bool ggml_sycl_same_native_context(const sycl::queue & a, const sycl::queue & b) {
++    if (a.get_context() == b.get_context()) {
++        return true;
++    }
++    if (a.get_backend() != sycl::backend::ext_oneapi_level_zero || b.get_backend() != sycl::backend::ext_oneapi_level_zero) {
++        return false;
++    }
++    return sycl::get_native<sycl::backend::ext_oneapi_level_zero>(a.get_context()) ==
++           sycl::get_native<sycl::backend::ext_oneapi_level_zero>(b.get_context());
++}
++
+ template <typename Ts> struct matrix_info_t {
+     oneapi::mkl::transpose transpose_info[2];
+     Ts                     value_info[2];
+@@ -807,7 +854,7 @@ namespace dpct
+           eh = exception_handler;
+         }
+         _queues.push_back(sycl::queue(
+-            *this, eh,
++            ggml_sycl_queue_context(*this), *this, eh,
+             sycl::property_list(
+ #ifdef DPCT_PROFILING_ENABLED
+                 sycl::property::queue::enable_profiling(),
+@@ -826,7 +873,7 @@ namespace dpct
+           eh = exception_handler;
+         }
+         _queues.push_back(sycl::queue(
+-            device, eh,
++            ggml_sycl_queue_context(device), device, eh,
+                         sycl::property_list(
+ #ifdef DPCT_PROFILING_ENABLED
+                             sycl::property::queue::enable_profiling(),
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.cpp b/ggml/src/ggml-sycl/fattn-onednn.cpp
+index 6e030940a..4667d8b80 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.cpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.cpp
+@@ -1,8 +1,10 @@
+ #include <array>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <string>
++#include <memory>
+ #include <optional>
+ #include <unordered_map>
+ #include <vector>
+@@ -60,6 +62,11 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+         if (!k_ok || !v_ok) {
+             return false;
+         }
++        // The staging branches require either two quantized caches or two F32 caches.
++        if (!((ggml_is_quantized(kt) && ggml_is_quantized(vt)) ||
++              (kt == GGML_TYPE_F32 && vt == GGML_TYPE_F32))) {
++            return false;
++        }
+         if (use_shape_limit && (Q->ne[1] < 32 || K->ne[1] < 1024)) {
+             return false;
+         }
+@@ -109,8 +116,9 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
+         return false;
+     }
+-    // Prefill only.
+-    if (use_shape_limit && Q->ne[1] < GGML_SYCL_FA_ONEDNN_MIN_Q) {
++    // Prefill only, unless GGML_SYCL_FA_ONEDNN_MIN_Q lowers the threshold (experiment: speculative verify batches).
++    static const int min_q = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MIN_Q", GGML_SYCL_FA_ONEDNN_MIN_Q);
++    if (use_shape_limit && Q->ne[1] < min_q) {
+         return false;
+     }
+     return true;
+@@ -402,17 +410,18 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+ 
+     // compile once per (device, shape, KV strides), reuse across layers/calls. Stride 2 always
+     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
+-    static std::unordered_map<std::string, sdpa_partition> cache;
++    // Cached per context: a partition only runs on the engine it was compiled for (an MTP draft context owns a second one).
+     char keyb[256];
+     snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
+              (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
+              (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
+              (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
+-    auto it = cache.find(keyb);
+-    if (it == cache.end()) {
+-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
++    std::shared_ptr<void> & slot = ctx.onednn_sdpa_cache[keyb];
++    if (!slot) {
++        slot = std::make_shared<sdpa_partition>(
++            build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str));
+     }
+-    sdpa_partition & E = it->second;
++    sdpa_partition & E = *std::static_pointer_cast<sdpa_partition>(slot);
+     if (!E.ok) {
+         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
+         ggml_sycl_flash_attn_ext_tile(ctx, dst);
+@@ -436,12 +445,14 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+     E.cp.execute(strm, ti, {to});
+ 
+     permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
+-    // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
+-    // serializes with the staging kernels before it and the permute/pool reuse after it. The
+-    // garbage output formerly blamed on the missing sync here was the scale use-after-return
+-    // fixed above. Keep the conservative wait for multi-GPU, where other devices' streams can
+-    // race the pool:
+-    if (ggml_sycl_info().device_count > 1) {
++    // The in-order queue orders SDPA, permutation, and pool reuse. Cross-device copies synchronize separately.
++    // Keep the conservative wait as an A/B control; out-of-order queues always need it.
++    static const bool force_sync = [] {
++        const char * value = std::getenv("GGML_SYCL_FA_ONEDNN_SYNC");
++        return !value || std::strcmp(value, "0") != 0;
++    }();
++    if (ggml_sycl_info().device_count > 1 &&
++        (force_sync || !stream->has_property<sycl::property::queue::in_order>())) {
+         stream->wait_and_throw();
+     }
+ }
+diff --git a/ggml/src/ggml-sycl/fattn-tile.hpp b/ggml/src/ggml-sycl/fattn-tile.hpp
+index dcdcad88a..76c46b70c 100644
+--- a/ggml/src/ggml-sycl/fattn-tile.hpp
++++ b/ggml/src/ggml-sycl/fattn-tile.hpp
+@@ -62,6 +62,10 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp16(const int DKQ, co
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 2,  64,  64)
+ 
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
++    // GQA-6 decode/verify (Qwen3.8): all 6 Q heads of a KV head in one tile, so K/V is read once instead of
++    // three times. 6 = 1 token x 6 heads (6 warps, 1 col each); 48 = 8 tokens x 6 heads (12 warps, 4 cols each).
++    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
++    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 48, 384, 2,  64,  64)
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
+@@ -125,6 +129,8 @@ static constexpr uint32_t ggml_sycl_fattn_tile_get_config_fp32(const int DKQ, co
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 2,  64,  64)
+ 
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
++    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32,  64)
++    GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 48, 384, 2,  32,  64)
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  32,  64)
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
+     GGML_SYCL_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
+@@ -1149,6 +1155,33 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggm
+     GGML_ABORT("fatal error");
+ }
+ 
++// GGML_SYCL_FA_GQA6=1: GQA ratio 6 at D=256 (Qwen3.8) with up to 8 query tokens. The generic ladder only groups
++// 8/4/2 heads, so gqa 6 fell back to pairs and every K/V row was read three times. Here one tile holds all six heads.
++template <int DKQ, int DV, bool use_logit_softcap>
++static void launch_fattn_tile_gqa6(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q = dst->src[0];
++    const int id        = ggml_sycl_get_device();
++    const int cc        = ggml_sycl_info().devices[id].cc;
++    constexpr int warp_size = WARP_32_SIZE;
++    constexpr int ncols2    = 6;
++    constexpr size_t nbytes_shared = 0;
++    if (Q->ne[1] > 1) {
++        constexpr int cols_per_block = 48;
++        const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
++        const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
++        launch_fattn<DV, cols_per_block/ncols2, ncols2,
++            flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
++            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
++    } else {
++        constexpr int cols_per_block = 6;
++        const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
++        const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
++        launch_fattn<DV, cols_per_block/ncols2, ncols2,
++            flash_attn_tile<DKQ, DV, cols_per_block / ncols2, ncols2, use_logit_softcap, warp_size>, warp_size>
++            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
++    }
++}
++
+ template <int DKQ, int DV, bool use_logit_softcap>
+ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * KQV  = dst;
+@@ -1193,6 +1226,14 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
+         }
+     }
+ 
++    if constexpr (DKQ == 256 && DV == 256) {
++        static const bool gqa6 = ggml_sycl_get_env("GGML_SYCL_FA_GQA6", 0) == 1;
++        if (gqa6 && use_gqa_opt && gqa_ratio % 6 == 0 && Q->ne[1] <= 8) {
++            launch_fattn_tile_gqa6<DKQ, DV, use_logit_softcap>(ctx, dst);
++            return;
++        }
++    }
++
+     if constexpr (DV <= 256) {
+         if (use_gqa_opt && gqa_ratio % 8 == 0) {
+             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+diff --git a/ggml/src/ggml-sycl/fattn-xmx.cpp b/ggml/src/ggml-sycl/fattn-xmx.cpp
+new file mode 100644
+index 000000000..cbd89c2d6
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-xmx.cpp
+@@ -0,0 +1,268 @@
++// XMX split-K flash attention for speculative verify on Intel Xe2 (Arc Pro B70).
++//
++// Scope: D = 256, Q heads per KV head = 6, 1..8 query tokens, one sequence, F16 K/V (cache views), F16 mask,
++// no sinks / ALiBi / softcap, n_kv a multiple of 128. All 48 query rows (8 tokens x 6 heads) of a KV head go
++// through the matrix units together, so every K/V byte is read once per step:
++//   S^T = K * Q^T   A = K tile (8 keys x 16 dims, from the cache), B = Q^T (SLM, pre-scaled f16)
++//   O  += P * V     A = P (SLM f16, online softmax), B = V tile (16 keys x 16 dims, from the cache)
++// A work-group handles one KV head x one contiguous chunk of keys; a second kernel merges the chunks.
++// The TILE kernel this replaces grouped heads in pairs for gqa 6 (K/V read three times) and ran the dot products
++// on the vector units; measured per GPU at 131K keys, 8 tokens: 1.82 ms -> 0.77 ms (standalone prototype).
++
++#include <sycl/sycl.hpp>
++#include <sycl/ext/oneapi/matrix/matrix.hpp>
++
++#include "fattn-xmx.hpp"
++
++namespace {
++
++namespace mx  = sycl::ext::oneapi::experimental::matrix;
++namespace mxi = sycl::ext::intel::experimental::matrix;
++using half    = sycl::half;
++
++constexpr int XD   = 256;        // head size
++constexpr int XG   = 6;          // query heads per KV head
++constexpr int XNT  = 8;          // max query tokens
++constexpr int XR   = XNT * XG;   // query rows per KV head
++constexpr int XKT  = 128;        // keys per tile
++constexpr int XNSG = 16;         // subgroups per work-group
++constexpr int XSG  = 16;         // subgroup size
++constexpr int XTM = 8, XTN = 16, XTK = 16;
++static_assert(XKT == XNSG * XTM, "one 8-key A tile per subgroup");
++static_assert(XD == XNSG * XTN, "one 16-dim output slice per subgroup");
++
++struct xmx_params {
++    const char * Q;  int64_t q_tok, q_head;   // byte strides, f32 data
++    const half * K;  int64_t k_key, k_head;   // element strides
++    const half * V;  int64_t v_key, v_head;
++    const half * mask; int64_t m_tok;         // element stride
++    int   ntok, n_kv, hkv, nsplit, tiles_per;
++    float scale;
++    float * opart;   // [hkv*nsplit][XR][XD]
++    float * meta;    // [hkv*nsplit][XR][2]
++    float * dst;     // [t][hq][XD]
++};
++
++void xmx_attn_launch(sycl::queue & q, const xmx_params & p) {
++    q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<half, 1>  QT(XD * XR, h);
++        sycl::local_accessor<float, 1> ST(XKT * XR, h);
++        sycl::local_accessor<half, 1>  P(XR * XKT, h);
++        sycl::local_accessor<float, 1> stat(3 * XR, h);
++        const xmx_params pp = p;
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) p.hkv * p.nsplit * XNSG * XSG), sycl::range<1>(XNSG * XSG)),
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(XSG)]] {
++            const auto sg   = it.get_sub_group();
++            const int  sgid = sg.get_group_id()[0];
++            const int  lane = sg.get_local_id()[0];
++            const int  g    = it.get_group(0);
++            const int  kvh  = g / pp.nsplit;
++            const int  sp   = g % pp.nsplit;
++            const int  lid  = it.get_local_id(0);
++
++            float * m_s  = &stat[0];
++            float * l_s  = &stat[XR];
++            float * rs_s = &stat[2 * XR];
++
++            for (int idx = lid; idx < XR * XD; idx += XNSG * XSG) {
++                const int r = idx / XD, d = idx % XD, t = r / XG, hl = r % XG;
++                float v = 0.0f;
++                if (t < pp.ntok) {
++                    v = ((const float *) (pp.Q + t * pp.q_tok + (kvh * XG + hl) * pp.q_head))[d] * pp.scale;
++                }
++                QT[d * XR + r] = (half) v;
++            }
++            for (int r = lid; r < XR; r += XNSG * XSG) { m_s[r] = -3.0e38f; l_s[r] = 0.0f; rs_s[r] = 1.0f; }
++            sycl::group_barrier(it.get_group());
++
++            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, XTM, XTN> acc[XR / XTM];
++#pragma unroll
++            for (int mi = 0; mi < XR / XTM; ++mi) mx::joint_matrix_fill(sg, acc[mi], 0.0f);
++
++            const auto Kg = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
++                pp.K + (size_t) kvh * pp.k_head);
++            const auto Vg = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
++                pp.V + (size_t) kvh * pp.v_head);
++            auto QTp = QT.template get_multi_ptr<sycl::access::decorated::no>();
++            auto STp = ST.template get_multi_ptr<sycl::access::decorated::no>();
++            auto Pp  = P.template get_multi_ptr<sycl::access::decorated::no>();
++
++            const int tile0 = sp * pp.tiles_per;
++            const int tile1 = sycl::min(tile0 + pp.tiles_per, pp.n_kv / XKT);
++            for (int tile = tile0; tile < tile1; ++tile) {
++                const int k0 = tile * XKT;
++
++                mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, XTM, XTN> s[XR / XTN];
++#pragma unroll
++                for (int n = 0; n < XR / XTN; ++n) mx::joint_matrix_fill(sg, s[n], 0.0f);
++#pragma unroll 4
++                for (int kd = 0; kd < XD; kd += XTK) {
++                    mx::joint_matrix<sycl::sub_group, half, mx::use::a, XTM, XTK, mx::layout::row_major> a;
++                    mx::joint_matrix_load(sg, a, Kg + (size_t) (k0 + sgid * XTM) * pp.k_key + kd, pp.k_key);
++#pragma unroll
++                    for (int n = 0; n < XR / XTN; ++n) {
++                        mx::joint_matrix<sycl::sub_group, half, mx::use::b, XTK, XTN, mx::layout::row_major> b;
++                        mx::joint_matrix_load(sg, b, QTp + kd * XR + n * XTN, XR);
++                        mx::joint_matrix_mad(sg, s[n], a, b, s[n]);
++                    }
++                }
++#pragma unroll
++                for (int n = 0; n < XR / XTN; ++n) {
++                    mx::joint_matrix_store(sg, s[n], STp + (sgid * XTM) * XR + n * XTN, XR, mx::layout::row_major);
++                }
++                sycl::group_barrier(it.get_group());
++
++                for (int rr = 0; rr < XR / XNSG; ++rr) {
++                    const int r = sgid * (XR / XNSG) + rr;
++                    const int t = r / XG;
++                    if (t >= pp.ntok) {
++                        for (int k = lane; k < XKT; k += XSG) P[r * XKT + k] = (half) 0.0f;
++                        if (lane == 0) rs_s[r] = 1.0f;
++                        continue;
++                    }
++                    float sv[XKT / XSG];
++                    float mloc = -3.0e38f;
++#pragma unroll
++                    for (int i = 0; i < XKT / XSG; ++i) {
++                        const int k = lane + i * XSG;
++                        sv[i] = ST[k * XR + r] + (float) pp.mask[t * pp.m_tok + k0 + k];
++                        mloc  = sycl::fmax(mloc, sv[i]);
++                    }
++                    const float m_old = m_s[r];
++                    const float m_new = sycl::fmax(m_old, sycl::reduce_over_group(sg, mloc, sycl::maximum<float>()));
++                    float sum = 0.0f;
++#pragma unroll
++                    for (int i = 0; i < XKT / XSG; ++i) {
++                        const float pv = sycl::native::exp(sv[i] - m_new);
++                        sum += pv;
++                        P[r * XKT + lane + i * XSG] = (half) pv;
++                    }
++                    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
++                    if (lane == 0) {
++                        const float sc = sycl::native::exp(m_old - m_new);
++                        rs_s[r] = sc;
++                        l_s[r]  = l_s[r] * sc + sum;
++                        m_s[r]  = m_new;
++                    }
++                }
++                sycl::group_barrier(it.get_group());
++
++#pragma unroll
++                for (int mi = 0; mi < XR / XTM; ++mi) {
++                    mxi::joint_matrix_apply(sg, acc[mi], [=](float & x, size_t row, size_t) { x *= rs_s[mi * XTM + row]; });
++                }
++#pragma unroll
++                for (int kk = 0; kk < XKT; kk += XTK) {
++                    mx::joint_matrix<sycl::sub_group, half, mx::use::b, XTK, XTN, mx::layout::row_major> b;
++                    mx::joint_matrix_load(sg, b, Vg + (size_t) (k0 + kk) * pp.v_key + sgid * XTN, pp.v_key);
++#pragma unroll
++                    for (int mi = 0; mi < XR / XTM; ++mi) {
++                        mx::joint_matrix<sycl::sub_group, half, mx::use::a, XTM, XTK, mx::layout::row_major> a;
++                        mx::joint_matrix_load(sg, a, Pp + (mi * XTM) * XKT + kk, XKT);
++                        mx::joint_matrix_mad(sg, acc[mi], a, b, acc[mi]);
++                    }
++                }
++                sycl::group_barrier(it.get_group());
++            }
++
++            const auto Og = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
++                pp.opart + (size_t) g * XR * XD);
++#pragma unroll
++            for (int mi = 0; mi < XR / XTM; ++mi) {
++                mx::joint_matrix_store(sg, acc[mi], Og + (mi * XTM) * XD + sgid * XTN, XD, mx::layout::row_major);
++            }
++            for (int r = lid; r < XR; r += XNSG * XSG) {
++                pp.meta[((size_t) g * XR + r) * 2 + 0] = m_s[r];
++                pp.meta[((size_t) g * XR + r) * 2 + 1] = l_s[r];
++            }
++        });
++    });
++
++    const xmx_params pp = p;
++    q.parallel_for(sycl::range<3>(p.ntok, p.hkv * XG, XD), [=](sycl::id<3> id) {
++        const int t = id[0], h = id[1], d = id[2];
++        const int kvh = h / XG, r = t * XG + h % XG;
++        float M = -3.0e38f;
++        for (int s = 0; s < pp.nsplit; ++s) M = sycl::fmax(M, pp.meta[((size_t) (kvh * pp.nsplit + s) * XR + r) * 2]);
++        float num = 0.0f, den = 0.0f;
++        for (int s = 0; s < pp.nsplit; ++s) {
++            const size_t gs = (size_t) kvh * pp.nsplit + s;
++            const float  w  = sycl::native::exp(pp.meta[(gs * XR + r) * 2] - M);
++            num += w * pp.opart[(gs * XR + r) * XD + d];
++            den += w * pp.meta[(gs * XR + r) * 2 + 1];
++        }
++        pp.dst[((size_t) t * pp.hkv * XG + h) * XD + d] = den > 0.0f ? num / den : 0.0f;
++    });
++}
++
++}  // namespace
++
++bool ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
++    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_FA_XMX", 0) == 1;
++    if (!enabled) {
++        return false;
++    }
++    const ggml_tensor * Q     = dst->src[0];
++    const ggml_tensor * K     = dst->src[1];
++    const ggml_tensor * V     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++
++    float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
++    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++
++    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (Q->ne[0] != XD || K->ne[0] != XD || V->ne[0] != XD) {
++        return false;
++    }
++    if (K->ne[2] == 0 || Q->ne[2] != K->ne[2] * XG || V->ne[2] != K->ne[2]) {
++        return false;
++    }
++    if (Q->ne[1] < 1 || Q->ne[1] > XNT || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
++        return false;
++    }
++    if (K->ne[1] % XKT != 0 || V->ne[1] != K->ne[1]) {
++        return false;
++    }
++    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1 ||
++        mask->ne[3] != 1 || sinks || max_bias != 0.0f || logit_softcap != 0.0f) {
++        return false;
++    }
++    if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) || mask->nb[0] != sizeof(half)) {
++        return false;
++    }
++    for (const ggml_tensor * t : { K, V }) {
++        if (t->nb[1] % sizeof(half) != 0 || t->nb[2] % sizeof(half) != 0) {
++            return false;
++        }
++    }
++    if (!ggml_is_contiguous(dst)) {
++        return false;
++    }
++
++    const int hkv   = (int) K->ne[2];
++    const int n_kv  = (int) K->ne[1];
++    const int tiles = n_kv / XKT;
++    int nsplit = tiles < 128 ? tiles : 128;
++    const int tiles_per = (tiles + nsplit - 1) / nsplit;
++    nsplit = (tiles + tiles_per - 1) / tiles_per;
++
++    ggml_sycl_pool_alloc<float> opart(ctx.pool(), (size_t) hkv * nsplit * XR * XD);
++    ggml_sycl_pool_alloc<float> meta(ctx.pool(), (size_t) hkv * nsplit * XR * 2);
++
++    xmx_params p;
++    p.Q = (const char *) Q->data;          p.q_tok = Q->nb[1];                  p.q_head = Q->nb[2];
++    p.K = (const half *) K->data;          p.k_key = K->nb[1] / sizeof(half);   p.k_head = K->nb[2] / sizeof(half);
++    p.V = (const half *) V->data;          p.v_key = V->nb[1] / sizeof(half);   p.v_head = V->nb[2] / sizeof(half);
++    p.mask = (const half *) mask->data;    p.m_tok = mask->nb[1] / sizeof(half);
++    p.ntok = (int) Q->ne[1]; p.n_kv = n_kv; p.hkv = hkv; p.nsplit = nsplit; p.tiles_per = tiles_per;
++    p.scale = scale;
++    p.opart = opart.get(); p.meta = meta.get(); p.dst = (float *) dst->data;
++
++    xmx_attn_launch(*ctx.stream(), p);
++    return true;
++}
+diff --git a/ggml/src/ggml-sycl/fattn-xmx.hpp b/ggml/src/ggml-sycl/fattn-xmx.hpp
+new file mode 100644
+index 000000000..b2fb97f57
+--- /dev/null
++++ b/ggml/src/ggml-sycl/fattn-xmx.hpp
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include "common.hpp"
++
++// XMX split-K flash attention for small query batches (speculative verify / decode) at D=256 with
++// grouped-query ratio 6 (Qwen3.8). Opt-in with GGML_SYCL_FA_XMX=1; returns false (caller falls back)
++// for any other shape.
++bool ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 42e46298e..3f8e5f66d 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -20,6 +20,7 @@
+ #include "fattn.hpp"
+ #include "fattn-onednn.hpp"
+ #include "fattn-sparse.hpp"
++#include "fattn-xmx.hpp"
+ 
+ #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
+     {                                                                                                            \
+@@ -302,6 +303,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+         return;
+     }
+ 
++    // opt-in XMX split-K kernel for small query batches at D=256 / gqa 6 (GGML_SYCL_FA_XMX=1)
++    if (ggml_sycl_flash_attn_ext_xmx(ctx, dst)) {
++        return;
++    }
++
+     // n_kv watchdog: log when n_kv differs from the last FA call with
+     // the same D — helps detect cache-truncation issues.
+     static int nkv_debug = ggml_sycl_get_env("GGML_SYCL_MKL_FA_DEBUG", 0);
+diff --git a/ggml/src/ggml-sycl/fusion.cpp b/ggml/src/ggml-sycl/fusion.cpp
+index 9b553829b..b6971a560 100644
+--- a/ggml/src/ggml-sycl/fusion.cpp
++++ b/ggml/src/ggml-sycl/fusion.cpp
+@@ -33,8 +33,11 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
+     }
+ 
+     // fused K-quant GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type
+-    // q4_K, the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
+-    const bool reorder_pair = wu->type == GGML_TYPE_Q4_K && wg->type == GGML_TYPE_Q4_K;
++    // q4_K and opt-in q8_0 (2+ columns), the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
++    static const bool enable_q8_glu = ggml_sycl_get_env("GGML_SYCL_Q8_GLU_FUSION", 0) != 0;
++    const bool q8_pair = enable_q8_glu && wu->type == GGML_TYPE_Q8_0 && wg->type == GGML_TYPE_Q8_0 &&
++                         act->ne[1] >= 2 && act->ne[0] % MATRIX_ROW_PADDING == 0;
++    const bool reorder_pair = (wu->type == GGML_TYPE_Q4_K && wg->type == GGML_TYPE_Q4_K) || q8_pair;
+     const bool plain_pair   = (wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_IQ4_XS) &&
+                             (wg->type == GGML_TYPE_Q5_K || wg->type == GGML_TYPE_IQ4_XS);
+ #ifdef GGML_SYCL_MMVQ_HAS_XMX
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index e07a18bdc..3ce276bed 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -34,6 +34,7 @@
+ 
+ #include <sycl/sycl.hpp>
+ #include <sycl/backend.hpp>
++#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+ #include <level_zero/ze_api.h>
+ #include <level_zero/zes_api.h>
+@@ -82,6 +83,7 @@
+ #include "ggml-sycl/opt-step.hpp"
+ #include "ggml-sycl/solve_tri.hpp"
+ #include "ggml-sycl/gated_delta_net.hpp"
++#include "ggml-sycl/mmvq-dpas.hpp"
+ #include "ggml-sycl/pool.hpp"
+ #include "ggml-sycl/cross_entropy_loss.hpp"
+ 
+@@ -900,6 +902,65 @@ catch (sycl::exception const &exc) {
+   std::exit(1);
+ }
+ 
++// Strided host<->device copies: n_copies rows of `size` bytes, rows `stride_tensor` apart on the device and
++// `stride_data` apart on the host. Without these, ggml falls back to one synchronous copy per row; tensor parallel
++// reads/writes every split KV row that way (a 40 MiB draft-cache checkpoint took ~250 ms, i.e. ~160 MB/s).
++// The device side is one bulk copy when its rows are dense (or nearly so); the host side is scattered on the CPU.
++static void ggml_backend_sycl_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
++                                                   void * data, size_t offset, size_t size, size_t n_copies,
++                                                   size_t stride_tensor, size_t stride_data) try {
++    const size_t span = (n_copies - 1) * stride_tensor + size;  // device bytes covering all rows
++    if (n_copies <= 1 || stride_tensor < size || span > 2 * n_copies * size) {
++        for (size_t i = 0; i < n_copies; i++) {
++            ggml_backend_sycl_buffer_get_tensor(buffer, tensor, (char *) data + i * stride_data, offset + i * stride_tensor, size);
++        }
++        return;
++    }
++    if (stride_data == stride_tensor) {
++        ggml_backend_sycl_buffer_get_tensor(buffer, tensor, data, offset, span);
++        return;
++    }
++    std::vector<char> tmp(span);
++    ggml_backend_sycl_buffer_get_tensor(buffer, tensor, tmp.data(), offset, span);
++    for (size_t i = 0; i < n_copies; i++) {
++        memcpy((char *) data + i * stride_data, tmp.data() + i * stride_tensor, size);
++    }
++}
++catch (sycl::exception const &exc) {
++  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
++            << ", line:" << __LINE__ << std::endl;
++  std::exit(1);
++}
++
++static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
++                                                   const void * data, size_t offset, size_t size, size_t n_copies,
++                                                   size_t stride_tensor, size_t stride_data) try {
++    // a bulk write is only safe when the device rows are dense (no bytes in between to preserve)
++    if (n_copies <= 1 || stride_tensor != size) {
++        for (size_t i = 0; i < n_copies; i++) {
++            ggml_backend_sycl_buffer_set_tensor(buffer, tensor, (const char *) data + i * stride_data, offset + i * stride_tensor, size);
++        }
++        return;
++    }
++    if (stride_data == size) {
++        ggml_backend_sycl_buffer_set_tensor(buffer, tensor, data, offset, n_copies * size);
++        return;
++    }
++    std::vector<char> tmp(n_copies * size);
++    for (size_t i = 0; i < n_copies; i++) {
++        memcpy(tmp.data() + i * size, (const char *) data + i * stride_data, size);
++    }
++    ggml_backend_sycl_buffer_set_tensor(buffer, tensor, tmp.data(), offset, n_copies * size);
++    // set_tensor may stage asynchronously through pinned slots; tmp dies here, so make sure it has been consumed
++    ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
++    SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream->wait()));
++}
++catch (sycl::exception const &exc) {
++  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
++            << ", line:" << __LINE__ << std::endl;
++  std::exit(1);
++}
++
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+ static bool ggml_sycl_is_l0_discrete_gpu(int device) {
+     return ggml_sycl_info().devices[device].l0_discrete_gpu;
+@@ -1096,8 +1157,8 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
+     /* .memset_tensor   = */ ggml_backend_sycl_buffer_memset_tensor,
+     /* .set_tensor      = */ ggml_backend_sycl_buffer_set_tensor,
+     /* .get_tensor      = */ ggml_backend_sycl_buffer_get_tensor,
+-    /* .set_tensor_2d   = */ NULL,
+-    /* .get_tensor_2d   = */ NULL,
++    /* .set_tensor_2d   = */ ggml_backend_sycl_buffer_set_tensor_2d,
++    /* .get_tensor_2d   = */ ggml_backend_sycl_buffer_get_tensor_2d,
+     /* .cpy_tensor      = */ ggml_backend_sycl_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_sycl_buffer_clear,
+     /* .reset           = */ ggml_backend_sycl_buffer_reset,
+@@ -3673,7 +3734,35 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+         }
+ 
+         if constexpr(quantize_enabled) {
+-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
++            static const bool share_q8 = ggml_sycl_get_env("GGML_SYCL_SHARE_Q8_1", 0) == 1;
++            const size_t q8_bytes = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
++            if (share_q8 && !split && src1_on_device && src1_is_contiguous) {
++                const void * fn = (const void *) &quantize_row_q8_1_sycl<quantize_f>;
++                auto & k = ctx.q8_share;
++                const bool hit = k.epoch == ctx.q8_share_epoch && k.src1 == src1 && k.data == src1->data &&
++                                 k.quant_fn == fn && k.ne10 == ne10 && k.nrows1 == nrows1 &&
++                                 k.padded == src1_padded_col_size;
++                if (!hit) {
++                    if (ctx.q8_share_cap < q8_bytes) {
++                        if (ctx.q8_share_buf) {
++                            stream->wait();
++                            sycl::free(ctx.q8_share_buf, *stream);
++                        }
++                        ctx.q8_share_cap = std::max<size_t>(q8_bytes, 1u << 20);
++                        ctx.q8_share_buf = (char *) sycl::malloc_device(ctx.q8_share_cap, *stream);
++                        GGML_ASSERT(ctx.q8_share_buf);
++                    }
++                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, ctx.q8_share_buf, ne10, nrows1, src1_padded_col_size, stream);
++                    k = { src1, src1->data, fn, ne10, nrows1, src1_padded_col_size, ctx.q8_share_epoch };
++                }
++                dev[i].src1_ddq = ctx.q8_share_buf;
++                static std::atomic<int> hits{0}, misses{0};
++                const int h = hit ? ++hits : hits.load(), m = hit ? misses.load() : ++misses;
++                if (h + m == 20000) {
++                    GGML_LOG_WARN("%s: GGML_SYCL_SHARE_Q8_1: %d of the first 20000 quantizations reused\n", __func__, h);
++                }
++            } else {
++            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), q8_bytes);
+ 
+             if (src1_on_device && src1_is_contiguous) {
+                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+@@ -3686,6 +3775,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+                     std::exit(1);
+                 }
+             }
++            }
+         }
+ 
+         if (dst_on_device) {
+@@ -5296,7 +5386,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+     } else if (use_mul_mat_vec_q) {
+         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+-        if (extra && extra->optimized_feature.reorder) {
++        if (!split && ggml_sycl_mul_mat_q8_dpas(ctx, src0, src1, dst)) {
++            // GGML_SYCL_Q8_DPAS: integer DPAS for reordered Q8_0 x 2..8 tokens (mmvq-dpas.cpp)
++        } else if (extra && extra->optimized_feature.reorder) {
+             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+         } else {
+             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+@@ -5466,9 +5558,14 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
+     }
+ 
+     // quant pairs the reorder kernel does not serve (mixed gate/up types, q5_K off BMG) take the
+-    // standard-layout fused path instead; same-type q4_K / q5_K keep the reorder path below
+-    const bool reorder_pair = wg->type == wu->type &&
+-        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device)));
++    // standard-layout fused path instead; same-type q4_K / q5_K and opt-in q8_0 on BMG keep the reorder path below
++    static const bool enable_q8_glu = ggml_sycl_get_env("GGML_SYCL_Q8_GLU_FUSION", 0) != 0;
++    const bool q8_pair = enable_q8_glu && wu->type == GGML_TYPE_Q8_0 && wg->type == GGML_TYPE_Q8_0 &&
++                         act->ne[1] >= 2 && act->ne[1] <= 8 && act->ne[0] % QK_K == 0 &&
++                         act->ne[0] % MATRIX_ROW_PADDING == 0 &&
++                         ggml_sycl_info().devices[ctx.device].hw_info.arch == gpu_arch::intel_gpu_bmg_g31;
++    const bool reorder_pair = q8_pair || (wg->type == wu->type &&
++        (wu->type == GGML_TYPE_Q4_K || (wu->type == GGML_TYPE_Q5_K && ggml_sycl_q5_k_mmvq_reuse(ctx.device))));
+     if (!reorder_pair) {
+         const auto is_plain_type = [](ggml_type type) {
+             return type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
+@@ -5504,6 +5601,40 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
+     const queue_ptr stream           = ctx.stream();
+     const int       src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
+ 
++    // GGML_SYCL_Q8_DPAS: up and gate through integer DPAS (one shared activation quantization), then the same
++    // split SwiGLU/GeGLU epilogue as below. Falls through to the dp4a fused kernel when the shape does not qualify.
++    if (q8_pair && act->nb[0] == sizeof(float) && act->ne[2] == 1 && act->ne[3] == 1) {
++        const int64_t M = wu->ne[1];
++        // fully fused SwiGLU (not swapped) into glu->data when it is a plain [M, ne11] contiguous tensor
++        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
++            ggml_is_contiguous(glu) && glu->ne[0] == M && glu->ne[1] == ne11 &&
++            ggml_sycl_q8_dpas_swiglu(ctx, wu->data, wg->data, (const float *) act->data,
++                                     (int64_t) (act->nb[1] / sizeof(float)), (int) ne11, (int) ne00, (int) M,
++                                     (float *) glu->data, (int64_t) glu->ne[0])) {
++            return true;
++        }
++        ggml_sycl_pool_alloc<float> dp_alloc(ctx.pool(), (size_t) M * ne11 * 2);
++        float * dp_up   = dp_alloc.get();
++        float * dp_gate = dp_up + (size_t) M * ne11;
++        if (ggml_sycl_q8_dpas_glu_pair(ctx, wu->data, wg->data, (const float *) act->data,
++                                       (int64_t) (act->nb[1] / sizeof(float)), (int) ne11, (int) ne00, (int) M,
++                                       dp_up, dp_gate)) {
++            ggml_tensor up_tmp   = *up;
++            ggml_tensor gate_tmp = *gate;
++            ggml_tensor glu_tmp  = *glu;
++            up_tmp.data   = dp_up;
++            gate_tmp.data = dp_gate;
++            glu_tmp.src[0] = &gate_tmp;
++            glu_tmp.src[1] = &up_tmp;
++            if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
++                ggml_sycl_swiglu(ctx, &glu_tmp);
++            } else {
++                ggml_sycl_geglu(ctx, &glu_tmp);
++            }
++            return true;
++        }
++    }
++
+     // one activation, quantized once and fully consumed into src1_ddq before the GEMV on this
+     // in-order queue, so glu->data aliasing the dead activation needs no memory-range check
+     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
+@@ -5513,11 +5644,36 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
+     quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne00, (int) ne11,
+                                                           src1_padded_cols, stream);
+ 
+-    return ggml_sycl_mul_mat_vec_q_glu_reorder(wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
+-                                               (float *) glu->data, (int) ne00, (int) wu->ne[1], (int) ne11,
++    static const bool split_requested = ggml_sycl_get_env("GGML_SYCL_Q8_GLU_SPLIT_EPILOGUE", 0) != 0;
++    const bool split_glu = q8_pair && split_requested;
++    ggml_sycl_pool_alloc<float> pair_alloc(ctx.pool());
++    float * pair = (float *) glu->data;
++    if (split_glu) {
++        if (wu->ne[1] <= 0 || (size_t) wu->ne[1] > SIZE_MAX / (sizeof(float) * 2 * (size_t) ne11)) {
++            return false;
++        }
++        pair = pair_alloc.alloc((size_t) wu->ne[1] * ne11 * 2);
++    }
++    const bool ok = ggml_sycl_mul_mat_vec_q_glu_reorder(wu->type, ggml_get_glu_op(glu), wu->data, wg->data, src1_ddq,
++                                               pair, (int) ne00, (int) wu->ne[1], (int) ne11,
+                                                /*stride_col_y_bytes=*/src1_padded_cols * (int) sizeof(block_q8_1) /
+                                                    QK8_1,
+-                                               /*stride_col_dst=*/(int) glu->ne[0], stream);
++                                               /*stride_col_dst=*/(int) glu->ne[0], stream, split_glu);
++    if (ok && split_glu) {
++        ggml_tensor up_tmp = *up;
++        ggml_tensor gate_tmp = *gate;
++        ggml_tensor glu_tmp = *glu;
++        up_tmp.data = pair;
++        gate_tmp.data = pair + (size_t) wu->ne[1] * ne11;
++        glu_tmp.src[0] = &gate_tmp;
++        glu_tmp.src[1] = &up_tmp;
++        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU) {
++            ggml_sycl_swiglu(ctx, &glu_tmp);
++        } else {
++            ggml_sycl_geglu(ctx, &glu_tmp);
++        }
++    }
++    return ok;
+ }
+ 
+ // Batch the run of consecutive L2_NORM siblings starting at node_idx into one launch.
+@@ -6626,8 +6782,91 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+     return skip;
+ }
+ 
++// GGML_SYCL_BATCH_CPY=1: a run of F32 -> F32 copies that differ only in their source/destination offsets (same
++// view_src on each side, same shape and strides) runs as one kernel. Qwen3.5/3.8 rollback emits one such copy per
++// rollback slot per delta-net layer (conv state after each of the last n_rs_seq + 1 tokens), so a verify cycle
++// launched ~9 tiny copy kernels per layer. The copies read conv_input and write distinct cache slots, so they are
++// independent and batching cannot change results. Returns the number of following nodes consumed.
++static int ggml_sycl_try_batch_cpy(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
++    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_BATCH_CPY", 0) == 1;
++    constexpr int max_batch = 32;
++    const ggml_tensor * first = cgraph->nodes[i];
++    if (!enabled || first->op != GGML_OP_CPY) {
++        return 0;
++    }
++    const ggml_tensor * s0 = first->src[0];
++    const ggml_tensor * d0 = first->src[1];
++    if (s0->type != GGML_TYPE_F32 || d0->type != GGML_TYPE_F32 || !s0->view_src || !d0->view_src) {
++        return 0;
++    }
++    auto same_shape = [&](const ggml_tensor * a, const ggml_tensor * b) {
++        for (int k = 0; k < GGML_MAX_DIMS; ++k) {
++            if (a->ne[k] != b->ne[k] || a->nb[k] != b->nb[k]) {
++                return false;
++            }
++        }
++        return a->type == b->type;
++    };
++    const char * src_ptr[max_batch];
++    char *       dst_ptr[max_batch];
++    int n = 0, last = i;
++    for (int j = i; j < cgraph->n_nodes && n < max_batch; ++j) {
++        const ggml_tensor * c = cgraph->nodes[j];
++        if (j > i && (ggml_sycl_is_view_or_noop(c) || (c->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
++            continue;
++        }
++        if (c->op != GGML_OP_CPY || (c->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            c->src[0]->view_src != s0->view_src || c->src[1]->view_src != d0->view_src ||
++            !same_shape(c->src[0], s0) || !same_shape(c->src[1], d0)) {
++            break;
++        }
++        src_ptr[n] = (const char *) c->src[0]->data;
++        dst_ptr[n] = (char *) c->src[1]->data;
++        ++n;
++        last = j;
++    }
++    if (n < 2) {
++        return 0;
++    }
++    {
++        static std::atomic<int> logged{0};
++        if (logged.fetch_add(1) == 0) {
++            GGML_LOG_WARN("%s: GGML_SYCL_BATCH_CPY active: batched %d copies of %lld floats into one kernel\n", __func__,
++                          n, (long long) ggml_nelements(s0));
++        }
++    }
++    struct ptrs { const char * s[max_batch]; char * d[max_batch]; } p;
++    for (int k = 0; k < n; ++k) { p.s[k] = src_ptr[k]; p.d[k] = dst_ptr[k]; }
++    const int64_t ne0 = s0->ne[0], ne1 = s0->ne[1], ne2 = s0->ne[2], ne3 = s0->ne[3];
++    const size_t sb0 = s0->nb[0], sb1 = s0->nb[1], sb2 = s0->nb[2], sb3 = s0->nb[3];
++    const int64_t de0 = d0->ne[0], de1 = d0->ne[1], de2 = d0->ne[2];
++    const size_t db0 = d0->nb[0], db1 = d0->nb[1], db2 = d0->nb[2], db3 = d0->nb[3];
++    const int64_t nelem = ggml_nelements(s0);
++    GGML_ASSERT(nelem == ggml_nelements(d0));
++    ctx.stream()->parallel_for(sycl::range<2>((size_t) n, (size_t) nelem), [=](sycl::id<2> id) {
++        const int     c = (int) id[0];
++        const int64_t e = (int64_t) id[1];
++        // source index (ggml_cpy copies in row-major element order of src into dst's order)
++        int64_t r = e;
++        const int64_t i0 = r % ne0; r /= ne0;
++        const int64_t i1 = r % ne1; r /= ne1;
++        const int64_t i2 = r % ne2; r /= ne2;
++        const int64_t i3 = r;
++        r = e;
++        const int64_t j0 = r % de0; r /= de0;
++        const int64_t j1 = r % de1; r /= de1;
++        const int64_t j2 = r % de2; r /= de2;
++        const int64_t j3 = r;
++        *(float *) (p.d[c] + j0 * db0 + j1 * db1 + j2 * db2 + j3 * db3) =
++            *(const float *) (p.s[c] + i0 * sb0 + i1 * sb1 + i2 * sb2 + i3 * sb3);
++    });
++    (void) ne3;
++    return last - i;
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
++    ++sycl_ctx->q8_share_epoch;  // GGML_SYCL_SHARE_Q8_1: never reuse a quantized activation across graph runs
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+@@ -6643,6 +6882,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+             i += nodes_to_skip;
+             continue;
+         }
++        if (node->op == GGML_OP_CPY) {
++            const int cpy_skip = ggml_sycl_try_batch_cpy(*sycl_ctx, cgraph, i);
++            if (cpy_skip != 0) {
++                i += cpy_skip;
++                continue;
++            }
++        }
+ #ifndef NDEBUG
+         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
+         for (int j = 0; j < GGML_MAX_SRC; j++) {
+@@ -7588,20 +7834,183 @@ struct ggml_backend_sycl_comm_context {
+     uint8_t * host_in[2]  = { nullptr, nullptr };
+     size_t    host_bytes  = 0;
+ 
++    // GGML_SYCL_TP_DIRECT: ping-pong pinned host buffers [device][parity] that the peer device reads directly
++    uint8_t * direct_out[2][2] = { { nullptr, nullptr }, { nullptr, nullptr } };
++    size_t    direct_bytes  = 0;
++    int       direct_parity = 0;
++
++    // GGML_SYCL_TP_GPUFLAG: pinned host words; flags at [0] and [16] (separate cache lines), timeout records at
++    // [32] and [48]. Each device stores its own flag and spins on the peer's, so the host never waits.
++    uint32_t * gpuflag   = nullptr;
++    uint32_t   flag_seq  = 0;
++
+     void free_host() {
+         for (int i = 0; i < 2; ++i) {
+             const sycl::context sctx = ((ggml_backend_sycl_context *) backends[i]->context)->stream()->get_context();
+             if (host_out[i]) { sycl::free(host_out[i], sctx); host_out[i] = nullptr; }
+             if (host_in[i])  { sycl::free(host_in[i],  sctx); host_in[i]  = nullptr; }
+         }
+-        host_bytes = 0;
++        // the direct-exchange buffers are all allocated through device 0's context (it differs from device 1's
++        // under GGML_SYCL_PER_DEVICE_CONTEXT), so free them through it too
++        const sycl::context sctx0 = ((ggml_backend_sycl_context *) backends[0]->context)->stream()->get_context();
++        for (int i = 0; i < 2; ++i) {
++            for (int p = 0; p < 2; ++p) {
++                if (direct_out[i][p]) { sycl::free(direct_out[i][p], sctx0); direct_out[i][p] = nullptr; }
++            }
++        }
++        if (gpuflag) {
++            sycl::free(gpuflag, ((ggml_backend_sycl_context *) backends[0]->context)->stream()->get_context());
++            gpuflag = nullptr;
++        }
++        host_bytes   = 0;
++        direct_bytes = 0;
+     }
+ };
+ 
++// Device-side join for GGML_SYCL_TP_GPUFLAG: after this queue's copy to host memory, publish `seq` in `mine` and
++// spin until the peer publishes the same `seq` in `peer`. Plain or atomic loads of host memory keep returning a
++// stale cached value on Arc Pro B70 (measured 2026-10-20), so the peer flag is read with an uncached L1/L3 hint.
++// The spin is capped (~0.5-1 s, under the Windows GPU timeout); on a miss it records `seq` in `err` and the next
++// exchange aborts instead of reading a half-written buffer silently.
++static void ggml_sycl_gpuflag_join(queue_ptr q, uint32_t * mine, const uint32_t * peer, uint32_t * err, uint32_t seq) {
++    using sys_atomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
++                                        sycl::access::address_space::global_space>;
++    q->single_task([=]() {
++        namespace sxe = sycl::ext::intel::experimental;
++        namespace sxo = sycl::ext::oneapi::experimental;
++        sys_atomic(*mine).store(seq, sycl::memory_order::release);
++        sxo::annotated_ptr<const volatile uint32_t, decltype(sxo::properties(
++            sxe::read_hint<sxe::cache_control<sxe::cache_mode::uncached, sxe::cache_level::L1, sxe::cache_level::L3>>))> pp(peer);
++        uint32_t k = 0;
++        while (*pp < seq) {
++            if (++k > 600000u) { *err = seq; break; }
++        }
++    });
++}
++
++// GGML_SYCL_TP_FUSED_AR=1 (with GGML_SYCL_TP_DIRECT + GGML_SYCL_TP_GPUFLAG, shared context): decode/verify-sized
++// all-reduce in two kernels per device instead of compress + copy-out + join + copy-in + add:
++//   K1: write this device's partial straight into its pinned host buffer (bf16 RNE above the threshold, else F32)
++//   K2: one item publishes `seq`; each work-group leader spins on the peer's flag (uncached reads) and releases its
++//       group; every item reads the peer partial from host memory (uncached: the buffers are reused every second
++//       exchange) and writes own + peer.
++// Same arithmetic as the symmetric bf16 / F32 paths, so both replicas stay bit-identical. Ping-pong parity makes
++// buffer reuse safe: a device overwrites buffer p again only two exchanges later, after the peer has signalled the
++// intervening exchange, which it does only after finishing its read of buffer p.
++template <typename T>
++static void ggml_sycl_fused_ar_device(queue_ptr q, float * out, T * host_mine, const T * host_peer, uint32_t * flag_mine,
++                                      const uint32_t * flag_peer, uint32_t * err, uint32_t seq, int64_t nelem) {
++    using sys_atomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
++                                        sycl::access::address_space::global_space>;
++    constexpr bool is_bf16 = std::is_same<T, uint16_t>::value;
++    auto to_wire = [](float x) -> T {
++        if constexpr (is_bf16) {
++            const uint32_t u = sycl::bit_cast<uint32_t>(x);
++            return (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
++        } else {
++            return x;
++        }
++    };
++    auto from_wire = [](T v) -> float {
++        if constexpr (is_bf16) {
++            return sycl::bit_cast<float>(((uint32_t) v) << 16);
++        } else {
++            return v;
++        }
++    };
++    // K1: partial -> pinned host
++    q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) { host_mine[i] = to_wire(out[i]); });
++    // K2: publish, join, read peer, sum
++    constexpr int wg = 256;
++    const size_t global = ((size_t) nelem + wg - 1) / wg * wg;
++    q->parallel_for(sycl::nd_range<1>(global, wg), [=](sycl::nd_item<1> it) {
++        namespace sxe = sycl::ext::intel::experimental;
++        namespace sxo = sycl::ext::oneapi::experimental;
++        if (it.get_global_id(0) == 0) {
++            sys_atomic(*flag_mine).store(seq, sycl::memory_order::release);
++        }
++        if (it.get_local_id(0) == 0) {
++            sxo::annotated_ptr<const volatile uint32_t, decltype(sxo::properties(
++                sxe::read_hint<sxe::cache_control<sxe::cache_mode::uncached, sxe::cache_level::L1, sxe::cache_level::L3>>))> fp(flag_peer);
++            uint32_t k = 0;
++            while (*fp < seq) {
++                if (++k > 600000u) { *err = seq; break; }
++            }
++        }
++        sycl::group_barrier(it.get_group());
++        const size_t i = it.get_global_id(0);
++        if (i < (size_t) nelem) {
++            sxo::annotated_ptr<const volatile T, decltype(sxo::properties(
++                sxe::read_hint<sxe::cache_control<sxe::cache_mode::uncached, sxe::cache_level::L1, sxe::cache_level::L3>>))> pp(host_peer);
++            const T peer = pp[i];
++            out[i] = from_wire(to_wire(out[i])) + from_wire(peer);
++        }
++    });
++}
++
++// dst0 <- src1 and dst1 <- src0 with one host wait and no CPU copy: each device reads the host buffer the other
++// device wrote. Needs both queues in one SYCL context. The B70s share the platform default context but report no
++// peer access, and a cross-device event wait aborts, so the host still joins once per exchange.
++static void ggml_sycl_comm_exchange_direct(ggml_backend_sycl_comm_context * comm, queue_ptr q0, queue_ptr q1,
++                                           void * dst0, const void * src1, void * dst1, const void * src0,
++                                           size_t nbytes) {
++    if (comm->direct_bytes < nbytes) {
++        q0->wait();
++        q1->wait();
++        for (int d = 0; d < 2; ++d) {
++            for (int p = 0; p < 2; ++p) {
++                if (comm->direct_out[d][p]) { sycl::free(comm->direct_out[d][p], q0->get_context()); }
++                comm->direct_out[d][p] = sycl::malloc_host<uint8_t>(nbytes, q0->get_context());
++                GGML_ASSERT(comm->direct_out[d][p]);
++            }
++        }
++        comm->direct_bytes = nbytes;
++    }
++    // ping-pong: this exchange's join (host wait, or both devices' flags) proves the previous exchange's reads of
++    // the other parity finished before either device overwrites it
++    const int p = (comm->direct_parity ^= 1);
++    uint8_t * out0 = comm->direct_out[0][p];
++    uint8_t * out1 = comm->direct_out[1][p];
++
++    static const bool gpu_join = ggml_sycl_get_env("GGML_SYCL_TP_GPUFLAG", 0) == 1;
++    sycl::event e0 = q0->memcpy(out0, src0, nbytes);
++    sycl::event e1 = q1->memcpy(out1, src1, nbytes);
++    if (gpu_join) {
++        if (!comm->gpuflag) {
++            comm->gpuflag = sycl::malloc_host<uint32_t>(64, q0->get_context());
++            GGML_ASSERT(comm->gpuflag);
++            std::memset(comm->gpuflag, 0, 64 * sizeof(uint32_t));
++            GGML_LOG_INFO("%s: GGML_SYCL_TP_GPUFLAG active (device-side join, no host wait)\n", __func__);
++        }
++        uint32_t * f = comm->gpuflag;
++        if (f[32] || f[48]) {
++            GGML_ABORT("GGML_SYCL_TP_GPUFLAG: device join timed out (dev0 seq %u, dev1 seq %u)", f[32], f[48]);
++        }
++        const uint32_t s = ++comm->flag_seq;
++        ggml_sycl_gpuflag_join(q0, f + 0,  f + 16, f + 32, s);
++        ggml_sycl_gpuflag_join(q1, f + 16, f + 0,  f + 48, s);
++    } else {
++        e0.wait();
++        e1.wait();
++    }
++    q0->memcpy(dst0, out1, nbytes);
++    q1->memcpy(dst1, out0, nbytes);
++}
++
+ // dst0 <- src1 and dst1 <- src0 through pinned host memory, with a single host wait
+ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue_ptr q0, queue_ptr q1,
+                                     void * dst0, const void * src1, void * dst1, const void * src0,
+                                     size_t nbytes) {
++    static const bool want_direct = ggml_sycl_get_env("GGML_SYCL_TP_DIRECT", 0) == 1;
++    if (want_direct && ggml_sycl_same_native_context(*q0, *q1)) {
++        static bool logged = false;
++        if (!logged) {
++            GGML_LOG_INFO("%s: GGML_SYCL_TP_DIRECT active (shared context, no CPU copy)\n", __func__);
++            logged = true;
++        }
++        ggml_sycl_comm_exchange_direct(comm, q0, q1, dst0, src1, dst1, src0, nbytes);
++        return;
++    }
+     if (comm->host_bytes < nbytes) {
+         q0->wait();
+         q1->wait();
+@@ -7708,6 +8117,63 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
+     queue_ptr q0 = ctx0->stream();
+     queue_ptr q1 = ctx1->stream();
+ 
++    // Fused decode/verify all-reduce (see ggml_sycl_fused_ar_device). F32 only; large tensors (prefill) keep the
++    // copy-engine path, which moves bulk data faster than kernel loads/stores over PCIe.
++    {
++        static const bool fused = ggml_sycl_get_env("GGML_SYCL_TP_FUSED_AR", 0) == 1 &&
++                                  ggml_sycl_get_env("GGML_SYCL_TP_DIRECT", 0) == 1 &&
++                                  ggml_sycl_get_env("GGML_SYCL_TP_GPUFLAG", 0) == 1;
++        static const bool sym   = ggml_sycl_get_env("GGML_SYCL_TP_BF16_SYM", 0) == 1;
++        constexpr int64_t fused_max = 65536;
++        constexpr int64_t bf16_min  = 32768;  // same threshold as the bf16 path below
++        if (fused && tensors[0]->type == GGML_TYPE_F32 && nelem <= fused_max && (sym || nelem < bf16_min) &&
++            ggml_sycl_same_native_context(*q0, *q1)) {
++            static bool logged = false;
++            if (!logged) {
++                GGML_LOG_INFO("%s: GGML_SYCL_TP_FUSED_AR active (2 kernels per device per all-reduce)\n", __func__);
++                logged = true;
++            }
++            const size_t need = (size_t) fused_max * sizeof(float);
++            if (comm_ctx->direct_bytes < need) {
++                q0->wait();
++                q1->wait();
++                for (int d = 0; d < 2; ++d) {
++                    for (int p = 0; p < 2; ++p) {
++                        if (comm_ctx->direct_out[d][p]) { sycl::free(comm_ctx->direct_out[d][p], q0->get_context()); }
++                        comm_ctx->direct_out[d][p] = sycl::malloc_host<uint8_t>(need, q0->get_context());
++                        GGML_ASSERT(comm_ctx->direct_out[d][p]);
++                    }
++                }
++                comm_ctx->direct_bytes = need;
++            }
++            if (!comm_ctx->gpuflag) {
++                comm_ctx->gpuflag = sycl::malloc_host<uint32_t>(64, q0->get_context());
++                GGML_ASSERT(comm_ctx->gpuflag);
++                std::memset(comm_ctx->gpuflag, 0, 64 * sizeof(uint32_t));
++            }
++            uint32_t * f = comm_ctx->gpuflag;
++            if (f[32] || f[48]) {
++                GGML_ABORT("GGML_SYCL_TP_FUSED_AR: device join timed out (dev0 seq %u, dev1 seq %u)", f[32], f[48]);
++            }
++            const int      p   = (comm_ctx->direct_parity ^= 1);
++            const uint32_t s   = ++comm_ctx->flag_seq;
++            float *        o0  = (float *) tensors[0]->data;
++            float *        o1  = (float *) tensors[1]->data;
++            if (nelem >= bf16_min) {
++                auto * h0 = (uint16_t *) comm_ctx->direct_out[0][p];
++                auto * h1 = (uint16_t *) comm_ctx->direct_out[1][p];
++                ggml_sycl_fused_ar_device<uint16_t>(q0, o0, h0, h1, f + 0,  f + 16, f + 32, s, nelem);
++                ggml_sycl_fused_ar_device<uint16_t>(q1, o1, h1, h0, f + 16, f + 0,  f + 48, s, nelem);
++            } else {
++                auto * h0 = (float *) comm_ctx->direct_out[0][p];
++                auto * h1 = (float *) comm_ctx->direct_out[1][p];
++                ggml_sycl_fused_ar_device<float>(q0, o0, h0, h1, f + 0,  f + 16, f + 32, s, nelem);
++                ggml_sycl_fused_ar_device<float>(q1, o1, h1, h0, f + 16, f + 0,  f + 48, s, nelem);
++            }
++            return true;
++        }
++    }
++
+     // Grow per-device byte buffers if needed (4 * nelem bytes each).
+     if (comm_ctx->buf_nelem < nelem) {
+         comm_ctx->buf0->realloc(nelem * 4);
+@@ -7779,7 +8245,21 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
+     uint16_t * outbox1 = (uint16_t *) buf1;
+     uint16_t * inbox1  = outbox1 + nelem;
+ 
++    // GGML_SYCL_TP_BF16_SYM=1: round both partials to bf16 (nearest-even) and have each device compute
++    // bf16(A) + bf16(B), so the two replicas stay bit-identical (IEEE addition of two terms is commutative).
++    // Default (unset): the original asymmetric path, A + trunc(B) on one device and trunc(A) + B on the other,
++    // which lets the replicas drift apart.
++    static const bool bf16_sym = ggml_sycl_get_env("GGML_SYCL_TP_BF16_SYM", 0) == 1;
++
+     // Phase A: compress each device's local partial in parallel.
++    if (bf16_sym) {
++        auto rne = [](float x) {
++            const uint32_t u = sycl::bit_cast<uint32_t>(x);
++            return (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
++        };
++        q0->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) { outbox0[i] = rne(out0[i]); });
++        q1->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) { outbox1[i] = rne(out1[i]); });
++    } else {
+     q0->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+         outbox0[i] = (uint16_t) (sycl::bit_cast<uint32_t>(out0[i]) >> 16);
+     });
+@@ -7787,11 +8267,23 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
+     q1->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+         outbox1[i] = (uint16_t) (sycl::bit_cast<uint32_t>(out1[i]) >> 16);
+     });
++    }
+ 
+     // Phase B: exchange the compressed bytes (in-order queues keep this after the compress kernels).
+     const size_t bf16_bytes = nelem * sizeof(uint16_t);
+     ggml_sycl_comm_exchange(comm_ctx, q0, q1, inbox0, outbox1, inbox1, outbox0, bf16_bytes);
+ 
++    if (bf16_sym) {
++        // Phase C (symmetric): own rounded partial + peer rounded partial, identical on both devices.
++        q0->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
++            out0[i] = sycl::bit_cast<float>(((uint32_t) outbox0[i]) << 16) + sycl::bit_cast<float>(((uint32_t) inbox0[i]) << 16);
++        });
++        q1->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
++            out1[i] = sycl::bit_cast<float>(((uint32_t) outbox1[i]) << 16) + sycl::bit_cast<float>(((uint32_t) inbox1[i]) << 16);
++        });
++        return true;
++    }
++
+     // Phase C: decompress + add into local FP32 partial.
+     q0->submit([&](sycl::handler & h) {
+         h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+diff --git a/ggml/src/ggml-sycl/mmvq-dpas.cpp b/ggml/src/ggml-sycl/mmvq-dpas.cpp
+new file mode 100644
+index 000000000..c345284fe
+--- /dev/null
++++ b/ggml/src/ggml-sycl/mmvq-dpas.cpp
+@@ -0,0 +1,297 @@
++// Integer-DPAS GEMV for reordered Q8_0 weights x 2..8 tokens on Intel Xe2 (Arc Pro B70).
++//
++//   A = weights, 8 rows x 32 int8 = one Q8_0 block per row, loaded straight from the reordered layout
++//       (row-major qs for all blocks, then the fp16 scales: see block_q_t<GGML_TYPE_Q8_0>)
++//   B = activations quantized per 32-block to int8 (d = amax/127, like q8_1) in the packed VNNI-4 layout
++//       [K/4][16][4]; tokens fill columns 0..ntok-1, the rest are zero
++//   C = 8 x 16 int32 per block, scaled by d_w[row][blk] * d_a[blk][tok] into per-lane float accumulators
++// A work-group (KSPLIT sub-groups) owns an 8-row tile and splits K; partial sums are reduced in SLM.
++// Standalone measurement (experimental/int8-dpas-2026-10-22), 8 tokens, per GPU: 8704x5120 85 vs 117 us,
++// 5120x8704 87 vs 119 us, 248320x5120 2314 vs 2967 us -- about 550-600 GB/s, where the dp4a kernel reached ~400.
++
++#include <sycl/sycl.hpp>
++#include <sycl/ext/oneapi/matrix/matrix.hpp>
++
++#include "mmvq-dpas.hpp"
++
++namespace {
++
++namespace mx  = sycl::ext::oneapi::experimental::matrix;
++namespace mxi = sycl::ext::intel::experimental::matrix;
++using half    = sycl::half;
++
++constexpr int DP_TM = 8, DP_TN = 16, DP_TK = 32;
++constexpr int DP_SG = 16;
++
++// x: ntok rows of K floats (row stride sx floats) -> bp [K/4][16][4] int8, da [K/32][16] float
++void dpas_quantize(sycl::queue & q, const float * x, int64_t sx, int ntok, int K, int8_t * bp, float * da) {
++    const int bpr = K / DP_TK;
++    q.parallel_for(sycl::range<2>((size_t) bpr, DP_TN), [=](sycl::id<2> id) {
++        const int b = (int) id[0], n = (int) id[1];
++        float d = 0.0f;
++        float v[DP_TK];
++        if (n < ntok) {
++            float amax = 0.0f;
++#pragma unroll
++            for (int k = 0; k < DP_TK; ++k) {
++                v[k] = x[(size_t) n * sx + (size_t) b * DP_TK + k];
++                amax = sycl::fmax(amax, sycl::fabs(v[k]));
++            }
++            d = amax / 127.0f;
++        }
++        const float id_ = d > 0.0f ? 1.0f / d : 0.0f;
++#pragma unroll
++        for (int k = 0; k < DP_TK; ++k) {
++            const int kk = b * DP_TK + k;
++            const int8_t qv = n < ntok ? (int8_t) sycl::round(v[k] * id_) : (int8_t) 0;
++            bp[((size_t) (kk / 4) * DP_TN + n) * 4 + kk % 4] = qv;
++        }
++        da[(size_t) b * DP_TN + n] = d;
++    });
++}
++
++template <int KSPLIT, int UNR>
++void dpas_gemv(sycl::queue & q, const int8_t * qs, const half * dw, const int8_t * bp, const float * da,
++               float * out, int64_t s_out, int M, int K, int ntok) {
++    const int bpr = K / DP_TK;
++    q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> red(KSPLIT * DP_TM * DP_TN, h);
++        h.parallel_for(sycl::nd_range<1>((size_t) (M / DP_TM) * KSPLIT * DP_SG, KSPLIT * DP_SG),
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(DP_SG)]] {
++            const auto sg   = it.get_sub_group();
++            const int  s    = sg.get_group_id()[0];
++            const int  row0 = it.get_group(0) * DP_TM;
++            const int  b0   = s * bpr / KSPLIT, b1 = (s + 1) * bpr / KSPLIT;
++            const auto qg = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(qs);
++            const auto bg = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(bp);
++
++            float facc[DP_TM * DP_TN / DP_SG] = {};
++            int b = b0;
++            for (; b + UNR <= b1; b += UNR) {
++                mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, DP_TM, DP_TN> c[UNR];
++#pragma unroll
++                for (int u = 0; u < UNR; ++u) {
++                    mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, DP_TM, DP_TK, mx::layout::row_major> a;
++                    mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, DP_TK, DP_TN, mx::layout::ext_intel_packed> bm;
++                    mx::joint_matrix_load(sg, a, qg + (size_t) row0 * K + (size_t) (b + u) * DP_TK, K);
++                    mx::joint_matrix_load(sg, bm, bg + (size_t) (b + u) * DP_TK * DP_TN, DP_TN * 4);
++                    mx::joint_matrix_fill(sg, c[u], 0);
++                    mx::joint_matrix_mad(sg, c[u], a, bm, c[u]);
++                }
++#pragma unroll
++                for (int u = 0; u < UNR; ++u) {
++                    int e = 0;
++                    const float * dab = da + (size_t) (b + u) * DP_TN;
++                    mxi::joint_matrix_apply(sg, c[u], [&](int32_t & x, size_t r, size_t col) {
++                        facc[e++] += (float) x * (float) dw[(size_t) (row0 + r) * bpr + b + u] * dab[col];
++                    });
++                }
++            }
++            for (; b < b1; ++b) {
++                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, DP_TM, DP_TK, mx::layout::row_major> a;
++                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, DP_TK, DP_TN, mx::layout::ext_intel_packed> bm;
++                mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, DP_TM, DP_TN> c;
++                mx::joint_matrix_load(sg, a, qg + (size_t) row0 * K + (size_t) b * DP_TK, K);
++                mx::joint_matrix_load(sg, bm, bg + (size_t) b * DP_TK * DP_TN, DP_TN * 4);
++                mx::joint_matrix_fill(sg, c, 0);
++                mx::joint_matrix_mad(sg, c, a, bm, c);
++                int e = 0;
++                const float * dab = da + (size_t) b * DP_TN;
++                mxi::joint_matrix_apply(sg, c, [&](int32_t & x, size_t r, size_t col) {
++                    facc[e++] += (float) x * (float) dw[(size_t) (row0 + r) * bpr + b] * dab[col];
++                });
++            }
++
++            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, DP_TM, DP_TN> coords;
++            mx::joint_matrix_fill(sg, coords, 0);
++            int e = 0;
++            mxi::joint_matrix_apply(sg, coords, [&](int32_t &, size_t r, size_t col) {
++                red[(s * DP_TM + r) * DP_TN + col] = facc[e++];
++            });
++            sycl::group_barrier(it.get_group());
++            for (int idx = it.get_local_id(0); idx < DP_TM * DP_TN; idx += KSPLIT * DP_SG) {
++                const int r = idx / DP_TN, col = idx % DP_TN;
++                if (col < ntok) {
++                    float v = 0.0f;
++#pragma unroll
++                    for (int k = 0; k < KSPLIT; ++k) v += red[(k * DP_TM + r) * DP_TN + col];
++                    out[(size_t) col * s_out + row0 + r] = v;
++                }
++            }
++        });
++    });
++}
++
++// Fused up/gate: one shared activation tile per block, two weight tiles, two DPAS; the reduction writes
++// silu(gate) * up straight to out (ggml SwiGLU, not swapped), so no pair buffer or separate GLU kernel.
++template <int KSPLIT, int UNR>
++void dpas_glu_swiglu(sycl::queue & q, const int8_t * qu, const half * du, const int8_t * qgate, const half * dg,
++                     const int8_t * bp, const float * da, float * out, int64_t s_out, int M, int K, int ntok) {
++    const int bpr = K / DP_TK;
++    q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> red(2 * KSPLIT * DP_TM * DP_TN, h);
++        h.parallel_for(sycl::nd_range<1>((size_t) (M / DP_TM) * KSPLIT * DP_SG, KSPLIT * DP_SG),
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(DP_SG)]] {
++            const auto sg   = it.get_sub_group();
++            const int  s    = sg.get_group_id()[0];
++            const int  row0 = it.get_group(0) * DP_TM;
++            const int  b0   = s * bpr / KSPLIT, b1 = (s + 1) * bpr / KSPLIT;
++            const auto ug = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(qu);
++            const auto gg = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(qgate);
++            const auto bg = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(bp);
++
++            float fu[DP_TM * DP_TN / DP_SG] = {};
++            float fg[DP_TM * DP_TN / DP_SG] = {};
++            auto step = [&](int bb, auto & cu, auto & cg) {
++                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, DP_TM, DP_TK, mx::layout::row_major> au, ag;
++                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, DP_TK, DP_TN, mx::layout::ext_intel_packed> bm;
++                mx::joint_matrix_load(sg, bm, bg + (size_t) bb * DP_TK * DP_TN, DP_TN * 4);
++                mx::joint_matrix_load(sg, au, ug + (size_t) row0 * K + (size_t) bb * DP_TK, K);
++                mx::joint_matrix_load(sg, ag, gg + (size_t) row0 * K + (size_t) bb * DP_TK, K);
++                mx::joint_matrix_fill(sg, cu, 0);
++                mx::joint_matrix_fill(sg, cg, 0);
++                mx::joint_matrix_mad(sg, cu, au, bm, cu);
++                mx::joint_matrix_mad(sg, cg, ag, bm, cg);
++            };
++            auto accum = [&](int bb, auto & cu, auto & cg) {
++                const float * dab = da + (size_t) bb * DP_TN;
++                int e = 0;
++                mxi::joint_matrix_apply(sg, cu, [&](int32_t & x, size_t r, size_t col) {
++                    fu[e++] += (float) x * (float) du[(size_t) (row0 + r) * bpr + bb] * dab[col];
++                });
++                e = 0;
++                mxi::joint_matrix_apply(sg, cg, [&](int32_t & x, size_t r, size_t col) {
++                    fg[e++] += (float) x * (float) dg[(size_t) (row0 + r) * bpr + bb] * dab[col];
++                });
++            };
++            int b = b0;
++            for (; b + UNR <= b1; b += UNR) {
++                mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, DP_TM, DP_TN> cu[UNR], cg[UNR];
++#pragma unroll
++                for (int u = 0; u < UNR; ++u) step(b + u, cu[u], cg[u]);
++#pragma unroll
++                for (int u = 0; u < UNR; ++u) accum(b + u, cu[u], cg[u]);
++            }
++            for (; b < b1; ++b) {
++                mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, DP_TM, DP_TN> cu, cg;
++                step(b, cu, cg);
++                accum(b, cu, cg);
++            }
++
++            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, DP_TM, DP_TN> coords;
++            mx::joint_matrix_fill(sg, coords, 0);
++            int e = 0;
++            mxi::joint_matrix_apply(sg, coords, [&](int32_t &, size_t r, size_t col) {
++                red[((0 * KSPLIT + s) * DP_TM + r) * DP_TN + col] = fu[e];
++                red[((1 * KSPLIT + s) * DP_TM + r) * DP_TN + col] = fg[e];
++                ++e;
++            });
++            sycl::group_barrier(it.get_group());
++            for (int idx = it.get_local_id(0); idx < DP_TM * DP_TN; idx += KSPLIT * DP_SG) {
++                const int r = idx / DP_TN, col = idx % DP_TN;
++                if (col < ntok) {
++                    float up = 0.0f, gate = 0.0f;
++#pragma unroll
++                    for (int k = 0; k < KSPLIT; ++k) {
++                        up   += red[((0 * KSPLIT + k) * DP_TM + r) * DP_TN + col];
++                        gate += red[((1 * KSPLIT + k) * DP_TM + r) * DP_TN + col];
++                    }
++                    out[(size_t) col * s_out + row0 + r] = gate / (1.0f + sycl::native::exp(-gate)) * up;
++                }
++            }
++        });
++    });
++}
++
++}  // namespace
++
++bool ggml_sycl_q8_dpas_swiglu(ggml_backend_sycl_context & ctx, const void * wu, const void * wg, const float * act,
++                              int64_t act_stride, int ntok, int K, int M, float * out, int64_t out_stride) {
++    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_Q8_DPAS", 0) == 1;
++    static const bool fused   = ggml_sycl_get_env("GGML_SYCL_Q8_DPAS_FUSED_GLU", 0) == 1;
++    if (!enabled || !fused || ntok < 2 || ntok > DP_TN / 2 || K % DP_TK != 0 || M % DP_TM != 0) {
++        return false;
++    }
++    queue_ptr stream = ctx.stream();
++    const int bpr = K / DP_TK;
++    ggml_sycl_pool_alloc<int8_t> bp(ctx.pool(), (size_t) K * DP_TN);
++    ggml_sycl_pool_alloc<float>  da(ctx.pool(), (size_t) bpr * DP_TN);
++    dpas_quantize(*stream, act, act_stride, ntok, K, bp.get(), da.get());
++    const int8_t * qu = (const int8_t *) wu;
++    const int8_t * qg = (const int8_t *) wg;
++    const half *   du = (const half *) ((const char *) wu + (size_t) M * K);
++    const half *   dg = (const half *) ((const char *) wg + (size_t) M * K);
++    if (K <= 4096) {
++        dpas_glu_swiglu<2, 2>(*stream, qu, du, qg, dg, bp.get(), da.get(), out, out_stride, M, K, ntok);
++    } else {
++        dpas_glu_swiglu<8, 2>(*stream, qu, du, qg, dg, bp.get(), da.get(), out, out_stride, M, K, ntok);
++    }
++    return true;
++}
++
++bool ggml_sycl_q8_dpas_glu_pair(ggml_backend_sycl_context & ctx, const void * wu, const void * wg, const float * act,
++                                int64_t act_stride, int ntok, int K, int M, float * up_out, float * gate_out) {
++    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_Q8_DPAS", 0) == 1;
++    if (!enabled || ntok < 2 || ntok > DP_TN / 2 || K % DP_TK != 0 || M % DP_TM != 0) {
++        return false;
++    }
++    queue_ptr stream = ctx.stream();
++    const int bpr = K / DP_TK;
++    ggml_sycl_pool_alloc<int8_t> bp(ctx.pool(), (size_t) K * DP_TN);
++    ggml_sycl_pool_alloc<float>  da(ctx.pool(), (size_t) bpr * DP_TN);
++    dpas_quantize(*stream, act, act_stride, ntok, K, bp.get(), da.get());
++    const void * w[2]   = { wu, wg };
++    float *      out[2] = { up_out, gate_out };
++    for (int i = 0; i < 2; ++i) {
++        const int8_t * qs = (const int8_t *) w[i];
++        const half *   dw = (const half *) ((const char *) w[i] + (size_t) M * K);
++        if (K <= 4096) {
++            dpas_gemv<2, 4>(*stream, qs, dw, bp.get(), da.get(), out[i], M, M, K, ntok);
++        } else {
++            dpas_gemv<8, 4>(*stream, qs, dw, bp.get(), da.get(), out[i], M, M, K, ntok);
++        }
++    }
++    return true;
++}
++
++bool ggml_sycl_mul_mat_q8_dpas(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               ggml_tensor * dst) {
++    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_Q8_DPAS", 0) == 1;
++    if (!enabled) {
++        return false;
++    }
++    const int64_t K = src0->ne[0], M = src0->ne[1], ntok = src1->ne[1];
++    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        ntok < 2 || ntok > DP_TN / 2 || K % DP_TK != 0 || M % DP_TM != 0 ||
++        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[0] != K ||
++        !ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) || !ggml_is_contiguous(dst) || dst->ne[0] != M) {
++        return false;
++    }
++    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++    if (!extra || !extra->optimized_feature.reorder) {
++        return false;  // the A loads assume the reordered layout (row-major qs, then scales)
++    }
++    static bool logged = false;
++    if (!logged) {
++        GGML_LOG_WARN("%s: GGML_SYCL_Q8_DPAS active (integer DPAS for 2..8-token Q8_0 mul_mat)\n", __func__);
++        logged = true;
++    }
++    queue_ptr stream = ctx.stream();
++    const int bpr = (int) (K / DP_TK);
++    ggml_sycl_pool_alloc<int8_t> bp(ctx.pool(), (size_t) K * DP_TN);
++    ggml_sycl_pool_alloc<float>  da(ctx.pool(), (size_t) bpr * DP_TN);
++
++    const int8_t * qs = (const int8_t *) src0->data;
++    const half *   dw = (const half *) ((const char *) src0->data + (size_t) M * K);
++
++    dpas_quantize(*stream, (const float *) src1->data, (int64_t) (src1->nb[1] / sizeof(float)), (int) ntok, (int) K,
++                  bp.get(), da.get());
++    float * out = (float *) dst->data;
++    const int64_t s_out = (int64_t) (dst->nb[1] / sizeof(float));
++    if (K <= 4096) {
++        dpas_gemv<2, 4>(*stream, qs, dw, bp.get(), da.get(), out, s_out, (int) M, (int) K, (int) ntok);
++    } else {
++        dpas_gemv<8, 4>(*stream, qs, dw, bp.get(), da.get(), out, s_out, (int) M, (int) K, (int) ntok);
++    }
++    return true;
++}
+diff --git a/ggml/src/ggml-sycl/mmvq-dpas.hpp b/ggml/src/ggml-sycl/mmvq-dpas.hpp
+new file mode 100644
+index 000000000..cac6d19dc
+--- /dev/null
++++ b/ggml/src/ggml-sycl/mmvq-dpas.hpp
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "common.hpp"
++
++// Integer-DPAS mul_mat for reordered Q8_0 weights x 2..8 F32 tokens (speculative verify batches), opt-in with
++// GGML_SYCL_Q8_DPAS=1. Returns false (caller uses the existing MMVQ path) for any other shape or layout.
++bool ggml_sycl_mul_mat_q8_dpas(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               ggml_tensor * dst);
++
++// Fused up/gate pair for the Q8 GLU fusion: one activation quantization, two integer-DPAS GEMVs writing
++// up_out[t*M + r] and gate_out[t*M + r]. Weights must be reordered Q8_0 [M x K]. Returns false if the shape does
++// not qualify or GGML_SYCL_Q8_DPAS is off.
++// Fully fused variant: writes silu(gate) * up directly (ggml SwiGLU, operands not swapped) into out[t*out_stride + r].
++// Opt-in with GGML_SYCL_Q8_DPAS_FUSED_GLU=1: measured 2026-10-22 it was ~0.5 ms/cycle slower than the pair path.
++bool ggml_sycl_q8_dpas_swiglu(ggml_backend_sycl_context & ctx, const void * wu, const void * wg, const float * act,
++                              int64_t act_stride, int ntok, int K, int M, float * out, int64_t out_stride);
++
++bool ggml_sycl_q8_dpas_glu_pair(ggml_backend_sycl_context & ctx, const void * wu, const void * wg, const float * act,
++                                int64_t act_stride, int ntok, int K, int M, float * up_out, float * gate_out);
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index ccb0363bd..5086efdc5 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -119,7 +119,8 @@ template <typename reorder_vec_dot_q_sycl, int ncols_dst, bool has_fusion = fals
+ static void mul_mat_vec_q_reorder_ncols(const void * __restrict__ vx, const void * __restrict__ vgate,
+                                         const void * __restrict__ vy, float * __restrict__ dst, const int ncols,
+                                         const int nrows, const int stride_col_y_bytes, const int stride_col_dst,
+-                                        const ggml_glu_op glu_op, const sycl::nd_item<3> & nd_item) {
++                                        const ggml_glu_op glu_op, const sycl::nd_item<3> & nd_item,
++                                        const bool split_glu = false) {
+     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+     using block_traits = typename block_type::traits;
+ 
+@@ -251,7 +252,17 @@ static void mul_mat_vec_q_reorder_ncols(const void * __restrict__ vx, const void
+                 const float gate = sycl::reduce_over_group(nd_item.get_sub_group(), partial_gate[j][r], std::plus<>());
+ 
+                 // uniform across the launch; the launcher only instantiates SWIGLU and GEGLU
+-                sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
++                if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
++                    if (split_glu) {
++                        if (sg.leader()) {
++                            dst[(size_t) nrows * ncols_dst + j * stride_col_dst + row0 + r] = gate;
++                        }
++                    } else {
++                        sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
++                    }
++                } else {
++                    sum *= glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate);
++                }
+             }
+ 
+             if (sg.leader() && row0 + r < nrows) {
+@@ -1254,28 +1265,47 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void * vx, const void * vy,
+     });
+ }
+ 
+-template <int ncols_dst>
+-static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
++template <int ncols_dst, int rows_per_sg>
++static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_impl(
+         const void * vx, const void * vy, float * dst,
+         const int ncols, const int nrows,
+         const int stride_col_y_bytes, const int stride_col_dst,
+         dpct::queue_ptr stream) {
+     GGML_ASSERT(ncols % QK8_0 == 0);
+     constexpr size_t num_subgroups = WARP_SIZE;
+-    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
++    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups * rows_per_sg);
+     const sycl::range<3> block_nums(1, 1, block_num_y);
+     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+ 
+     stream->submit([&](sycl::handler & cgh) {
+         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+-                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>, ncols_dst>(
++                             mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>, ncols_dst,
++                                                         /*has_fusion=*/ false, rows_per_sg>(
+                                  vx, /*vgate=*/ nullptr, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst,
+                                  /*glu_op=*/ GGML_GLU_OP_SWIGLU, nd_item);
+                          });
+     });
+ }
+ 
++// GGML_SYCL_Q8_MMVQ_ROWS (experiment, default 1): rows per sub-group for 3+ destination columns, so one activation
++// load is reused across that many weight rows. The weight half is shared across columns regardless.
++template <int ncols_dst>
++static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
++        const void * vx, const void * vy, float * dst,
++        const int ncols, const int nrows,
++        const int stride_col_y_bytes, const int stride_col_dst,
++        dpct::queue_ptr stream) {
++    static const int rows = ggml_sycl_get_env("GGML_SYCL_Q8_MMVQ_ROWS", 1);
++    if (ncols_dst >= 3 && rows == 4) {
++        reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_impl<ncols_dst, 4>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
++    } else if (ncols_dst >= 3 && rows == 2) {
++        reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_impl<ncols_dst, 2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
++    } else {
++        reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_impl<ncols_dst, 1>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
++    }
++}
++
+ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
+         const void * vx, const void * vy, float * dst,
+         const int ncols, const int nrows, const int ncols_dst,
+@@ -3476,11 +3506,12 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
+     }
+ }
+ 
+-template <typename reorder_vec_dot_q_sycl, int ncols_dst, int rows_per_sg>
++template <typename reorder_vec_dot_q_sycl, int ncols_dst, int rows_per_sg,
++          bool shared_weights = reorder_vec_dot_shared_weights<reorder_vec_dot_q_sycl::gtype>::value>
+ static void launch_mul_mat_vec_q_reorder_glu_impl(const void * vx, const void * vgate, const void * vy, float * dst,
+                                              const int ncols, const int nrows, const int stride_col_y_bytes,
+                                              const int stride_col_dst, const ggml_glu_op glu_op,
+-                                             dpct::queue_ptr stream) {
++                                             dpct::queue_ptr stream, bool split_glu = false) {
+     GGML_ASSERT(ncols % QK_K == 0);
+ 
+     constexpr size_t num_subgroups = WARP_SIZE;
+@@ -3493,9 +3524,9 @@ static void launch_mul_mat_vec_q_reorder_glu_impl(const void * vx, const void *
+         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                              mul_mat_vec_q_reorder_ncols<reorder_vec_dot_q_sycl, ncols_dst, /*has_fusion=*/ true,
+-                                                        rows_per_sg>(
++                                                        rows_per_sg, shared_weights>(
+                                  vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op,
+-                                 nd_item);
++                                 nd_item, split_glu);
+                          });
+     });
+ }
+@@ -3504,7 +3535,20 @@ template <typename reorder_vec_dot_q_sycl, int ncols_dst>
+ static void launch_mul_mat_vec_q_reorder_glu(const void * vx, const void * vgate, const void * vy, float * dst,
+                                              const int ncols, const int nrows, const int stride_col_y_bytes,
+                                              const int stride_col_dst, const ggml_glu_op glu_op,
+-                                             dpct::queue_ptr stream) {
++                                             dpct::queue_ptr stream, bool split_glu = false) {
++    // GGML_SYCL_Q8_GLU_MODE (experiment, Q8_0 at 5+ columns): 0 = per-column weight reload (the original path),
++    // 1 = weights shared across columns, 2 = shared weights + 2 rows per sub-group (shared activations)
++    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0 && ncols_dst >= 5) {
++        static const int mode = ggml_sycl_get_env("GGML_SYCL_Q8_GLU_MODE", 0);
++        if (mode == 2) {
++            launch_mul_mat_vec_q_reorder_glu_impl<reorder_vec_dot_q_sycl, ncols_dst, 2, true>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream, split_glu);
++        } else if (mode == 1) {
++            launch_mul_mat_vec_q_reorder_glu_impl<reorder_vec_dot_q_sycl, ncols_dst, 1, true>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream, split_glu);
++        } else {
++            launch_mul_mat_vec_q_reorder_glu_impl<reorder_vec_dot_q_sycl, ncols_dst, 1, false>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream, split_glu);
++        }
++        return;
++    }
+     // q4_K pairs rows for 3..4 columns, q5_K for 3..5
+     constexpr int row_pair_max = reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K ? 5 : 4;
+     constexpr int rows_per_sg =
+@@ -3512,7 +3556,7 @@ static void launch_mul_mat_vec_q_reorder_glu(const void * vx, const void * vgate
+                 ncols_dst <= row_pair_max
+             ? 2
+             : 1;
+-    launch_mul_mat_vec_q_reorder_glu_impl<reorder_vec_dot_q_sycl, ncols_dst, rows_per_sg>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
++    launch_mul_mat_vec_q_reorder_glu_impl<reorder_vec_dot_q_sycl, ncols_dst, rows_per_sg>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream, split_glu);
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -3703,7 +3747,8 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(enum ggml_type gate_type, enum ggml_type
+ template <ggml_type type, int... Ns>
+ static bool mul_mat_vec_q_glu_reorder_ncols(enum ggml_glu_op glu_op, const void * vx, const void * vgate,
+                                             const void * vy, float * dst, int ncols, int nrows, int ncols_dst,
+-                                            int stride_col_y_bytes, int stride_col_dst, dpct::queue_ptr stream) {
++                                            int stride_col_y_bytes, int stride_col_dst, dpct::queue_ptr stream,
++                                            bool split_glu = false) {
+     using vec_dot = reorder_vec_dot_q_sycl<type>;
+ 
+     auto launch = [&](auto I) -> bool {
+@@ -3718,7 +3763,7 @@ static bool mul_mat_vec_q_glu_reorder_ncols(enum ggml_glu_op glu_op, const void
+             }
+         }
+         launch_mul_mat_vec_q_reorder_glu<vec_dot, n>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes,
+-                                                     stride_col_dst, glu_op, stream);
++                                                     stride_col_dst, glu_op, stream, split_glu);
+         return true;
+     };
+ 
+@@ -3729,10 +3774,14 @@ static bool mul_mat_vec_q_glu_reorder_ncols(enum ggml_glu_op glu_op, const void
+ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
+                                          const void * vgate, const void * vy, float * dst, int ncols, int nrows,
+                                          int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
+-                                         dpct::queue_ptr stream) {
++                                         dpct::queue_ptr stream, bool split_glu) {
+     if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+         return false;
+     }
++    // q8_0 split_glu writes contiguous [up | gate] rows for the standalone GLU kernel
++    if (split_glu && (src0_type != GGML_TYPE_Q8_0 || nrows <= 0 || stride_col_dst != nrows)) {
++        return false;
++    }
+ 
+     switch (src0_type) {
+         case GGML_TYPE_Q4_K:
+@@ -3742,6 +3791,10 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
+             // fusion declines q5_K past 5 columns
+             return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q5_K, 1, 2, 3, 4, 5>(
+                 glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
++        case GGML_TYPE_Q8_0:
++            return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q8_0, 1, 2, 3, 4, 5, 6, 7, 8>(
++                glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream,
++                split_glu);
+         default:
+             return false;
+     }
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index 5649cbcd2..016f7f1e9 100644
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -65,6 +65,7 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
+ 
+ // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
+ // vx / vgate must share shape, stride and reorder layout. Returns false if unhandled.
++// Q8 split_glu writes contiguous [up | gate] matrices; dst needs 2*nrows*ncols_dst floats.
+ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+     enum ggml_type     src0_type,
+     enum ggml_glu_op   glu_op,
+@@ -77,7 +78,8 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(
+     int                ncols_dst,            // activation columns, 1..MMVQ_MAX_BATCH_SIZE
+     int                stride_col_y_bytes,   // bytes between activation columns in vy
+     int                stride_col_dst,       // floats between output columns in dst
+-    dpct::queue_ptr    stream);
++    dpct::queue_ptr    stream,
++    bool              split_glu = false);
+ 
+ 
+ // Fused dense-FFN GEMV on the XMX engines for reordered weights of one type, up * act(gate) for up to
+diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
+index f547b20e6..f7179e277 100644
+--- a/ggml/src/ggml-sycl/vecdotq.hpp
++++ b/ggml/src/ggml-sycl/vecdotq.hpp
+@@ -400,6 +400,14 @@ template <> struct reorder_vec_dot_shared_activations<GGML_TYPE_Q5_K> {
+     static constexpr bool value = true;
+ };
+ 
++template <> struct reorder_vec_dot_shared_weights<GGML_TYPE_Q8_0> {
++    static constexpr bool value = true;
++};
++
++template <> struct reorder_vec_dot_shared_activations<GGML_TYPE_Q8_0> {
++    static constexpr bool value = true;
++};
++
+ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
+     static constexpr ggml_type gtype = GGML_TYPE_Q4_0;
+ 
+@@ -481,6 +489,57 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
+     using q8_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+     using q8_0_traits = typename q8_0_block::traits;
+ 
++    // Split form for multi-column mul_mat_vec (speculative verify batches): the weight half is loaded once per
++    // block and reused for every destination column (shared weights), and one activation load is reused across
++    // the rows a sub-group handles (shared activations). Same arithmetic as operator() below.
++    struct weights {
++        int   v[q8_0_traits::vdr_mmvq];
++        float d;
++    };
++
++    struct activations {
++        int   u[q8_0_traits::vdr_mmvq];
++        float d8;
++    };
++
++    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
++                                        const std::pair<int, int> d_offset, const int & iqs) {
++        const uint8_t * base = static_cast<const uint8_t *>(vbq);
++        const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
++        weights w;
++        w.d = static_cast<float>(*reinterpret_cast<const ggml_half *>(base + d_offset.first));
++#pragma unroll
++        for (int i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
++            w.v[i] = get_int_from_int8(qs, iqs + i);
++        }
++        return w;
++    }
++
++    __dpct_inline__ static activations load_activations(const int8_t * q8_1_quant_ptr,
++                                                        const sycl::half2 * q8_1_ds, const int & iqs) {
++        activations a;
++#pragma unroll
++        for (int i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
++            a.u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
++        }
++        a.d8 = static_cast<float>((*q8_1_ds)[0]);
++        return a;
++    }
++
++    __dpct_inline__ static float apply(const weights & w, const activations & a) {
++        int sumi = 0;
++#pragma unroll
++        for (int i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
++            sumi = dpct::dp4a(w.v[i], a.u[i], sumi);
++        }
++        return w.d * a.d8 * sumi;
++    }
++
++    __dpct_inline__ static float dot(const weights & w, const int8_t * q8_1_quant_ptr,
++                                     const sycl::half2 * q8_1_ds, const int & iqs) {
++        return apply(w, load_activations(q8_1_quant_ptr, q8_1_ds, iqs));
++    }
++
+     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                      const sycl::half2 * q8_1_ds, const int & iqs,
+diff --git a/include/llama.h b/include/llama.h
+index 3af6e2223..fe9025ba4 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -605,6 +605,8 @@ extern "C" {
+     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
++    // true when every layer uses sliding-window attention (n_swa > 0)
++    LLAMA_API bool    llama_model_is_swa_all   (const struct llama_model * model);
+ 
+     // Get the model's RoPE frequency scaling factor
+     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 60199d6d9..92503c83a 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -29,6 +29,7 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <cmath>
+ #include <functional>
+@@ -615,8 +616,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+         }
+ 
+         // output
++        // LLAMA_TEST_TP_SPLIT_TARGET_HEAD (experiment): keep mirroring only the drafter's head and split the
++        // target's 248K-row head across the GPUs, so each computes half the vocabulary instead of all of it
++        const bool split_target_head = std::getenv("LLAMA_TEST_TP_SPLIT_TARGET_HEAD") != nullptr;
++        const bool mirror_arch = ud->model->arch == LLM_ARCH_DFLASH ||
++            (ud->model->arch == LLM_ARCH_QWEN35 && !split_target_head);
+         if (std::regex_match(tensor_name, pattern_output_weight)) {
+-            if (is_dsv4) {
++            const bool test_mirror = std::getenv("LLAMA_TEST_DFLASH_TP_MIRROR_HEAD") != nullptr && mirror_arch;
++            if (test_mirror) {
++                LLAMA_LOG_WARN("TP_HEAD_TEST: mirror output.weight for %s\n", ud->model->arch_name().c_str());
++            }
++            if (is_dsv4 || test_mirror) {
+                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+             }
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+@@ -624,6 +634,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+         if (std::regex_match(tensor_name, pattern_output_bias)) {
+             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
+             GGML_ASSERT(output_weight != nullptr);
++            if (std::getenv("LLAMA_TEST_DFLASH_TP_MIRROR_HEAD") != nullptr && mirror_arch) {
++                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++            }
+             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+         }
+ 
+@@ -3423,6 +3436,19 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
+     return model->hparams.n_head_kv();
+ }
+ 
++bool llama_model_is_swa_all(const llama_model * model) {
++    const auto & hp = model->hparams;
++    if (hp.n_swa == 0 || hp.n_layer() == 0) {
++        return false;
++    }
++    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
++        if (!hp.is_swa(il)) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ int32_t llama_model_n_swa(const llama_model * model) {
+     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
+     // other compression ratios, so we return 0 here
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f490d201c..078e04b7c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7740,6 +7740,23 @@ struct test_mul_mat_add : public test_case {
+     }
+ };
+ 
++struct test_q8_convert_reorder : public test_case {
++    const int64_t k;
++    const int64_t rows;
++    test_q8_convert_reorder(int64_t k, int64_t rows) : k(k), rows(rows) {}
++    std::string vars() override { return VARS_TO_STR2(k, rows); }
++    std::string op_desc(ggml_tensor *) override { return "Q8_CONVERT_REORDER"; }
++    bool run_whole_graph() override { return true; }
++    double max_nmse_err() override { return 5e-4; }
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        auto * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, rows);
++        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 64);
++        auto * small = ggml_mul_mat(ctx, weights, ggml_view_2d(ctx, input, k, 8, input->nb[1], 0));
++        auto * large = ggml_mul_mat(ctx, weights, input);
++        return ggml_concat(ctx, ggml_reshape_1d(ctx, small, rows * 8), ggml_reshape_1d(ctx, large, rows * 64), 0);
++    }
++};
++
+ struct test_mul_mat_vec_fusion : public test_case {
+     const ggml_type type;
+     const ggml_glu_op glu_op;
+@@ -12058,7 +12075,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
+     // mixed quant and Q1_0 test cases
++    for (auto dims : {std::pair<int64_t, int64_t>{5120, 17408}, {17408, 5120}, {5120, 513}, {17408, 513}, {544, 17}, {32, 1}, {544, 1929}, {5120, 192}}) {
++        test_cases.emplace_back(new test_q8_convert_reorder(dims.first, dims.second));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++    // Qwen3.8 decode/verify shapes (gqa 6, D 256): per-GPU tensor-parallel (2 kv heads) and full (4 kv heads),
++    // cache-like K/V views, 1..8 query tokens, KV lengths incl. one that is not a multiple of the tile.
++    for (int64_t nh : {2, 4}) {
++        for (int64_t kv : {512, 1536, 4352}) {
++            for (int64_t nb : {1, 2, 5, 8}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0));
++            }
++        }
++    }
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 128, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
+@@ -12620,6 +12652,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
+     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
+ 
++    // Qwen3.8-27B Q8_0 per-GPU shapes under tensor parallel (m = output rows, k = input): FFN up/gate (17408 split
++    // in two), FFN down (k split), mirrored 248320-row output head, attention-sized projection; decode/verify batches
++    for (int bs : {1, 8}) {
++        for (auto mk : std::vector<std::pair<int, int>>{{8704, 5120}, {5120, 8704}, {248320, 5120}, {5120, 3072}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
++        }
++    }
++
+     for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
+         for (ggml_type type_a : all_types) {
+             for (ggml_type type_b : {GGML_TYPE_F32}) {
+@@ -12680,6 +12720,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
+     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // Qwen3.8-27B decode per GPU under tensor parallel (24 q / 4 kv heads split in two: 2 kv heads, gqa 6, D 256),
++    // F16 KV cache viewed like the real cache, 1-token decode and 8-token speculative verify, long contexts.
++    for (int64_t kv : {32768, 65536, 131072}) {
++        for (int64_t nb : {1, 8}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0));
++        }
++    }
++
+     // Sparse flash attention (n_kv_max hint) decode across KV depths.
+     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
+     for (int64_t kv : {4096, 16384, 32768}) {
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a0acf1655..1363fb421 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2719,10 +2719,19 @@ private:
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
++        static const bool ckpt_timing = getenv("LLAMA_DFLASH_PROCESS_TIMING") && atoi(getenv("LLAMA_DFLASH_PROCESS_TIMING")) != 0;
++        const int64_t t_c0 = ggml_time_us();
+         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        const int64_t t_c1 = ggml_time_us();
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        const int64_t t_c2 = ggml_time_us();
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++        if (ckpt_timing) {
++            SLT_WRN(slot, "CKPT_TIMING n_tokens=%" PRId64 " tgt %.1f MiB %.1f ms, dft %.1f MiB %.1f ms\n", cur.n_tokens,
++                    (cur.size() - cur.data_dft.size()) / 1048576.0, (t_c1 - t_c0) / 1000.0, cur.data_dft.size() / 1048576.0,
++                    (t_c2 - t_c1) / 1000.0);
++        }
+ 
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+@@ -4223,6 +4232,11 @@ private:
+ 
+                     slot.mem.seq_rm(slot.id, p0, -1);
+ 
++                    // where this prompt ends, so a sliding-window draft can skip prompt rows it never attends
++                    if (spec) {
++                        common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next() - 1);
++                    }
++
+                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
+                     bool wait_shared = false;
+                     if (slot.task->n_tokens_shared > 0) {
