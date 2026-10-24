@@ -192,6 +192,10 @@ Published acceptance (greedy, GSM8K-style) is ~50%+. On real agent work at tempe
 
 All speed claims compare **time per cycle at temperature 1.0, averaged over 6 fixed seeds** on a 94K-token code prompt. At temperature 1.0, tokens/s for a single sample swings ±25% with the sampled text, while time per cycle is stable to ±0.5 ms. Correctness is checked with a 64-token greedy probe against the layer-split reference (64/64 for every adopted change), three image turns, and checkpoint-restore runs.
 
+## License
+
+MIT (see `LICENSE`). The patch modifies llama.cpp, which is also MIT (© the ggml authors).
+
 ## Caveats
 
 - One machine, one driver, one model. Other Intel GPUs (Xe, Xe2 iGPU, A-series) are untested.
