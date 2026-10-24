@@ -32,8 +32,9 @@ How to read the table:
 |---|---|
 | GPUs | 2× Intel Arc Pro B70 32 GB (no peer-to-peer between them) |
 | CPU / RAM | i7-14700K / 32 GB |
-| OS | Windows 11 Pro |
-| Compiler | Intel oneAPI DPC++/C++ 2026.1 |
+| OS | Windows 11 Pro (build 26200) |
+| GPU driver | Intel Arc Pro graphics driver 32.0.101.9150 |
+| Compiler | Intel oneAPI DPC++/C++ 2026.1.0 (build 20260617) |
 | Level Zero | Level Zero SDK 1.33.1 |
 | oneDNN | built from source with SYCL runtimes (`scripts/build-onednn.bat`, oneDNN main at `6e2d02e2b`) |
 | llama.cpp | upstream `d81d0d8fb` ("Multi-column on Intel XMX matrix engines refactored (#29864)") + `patches/llama.cpp-d81d0d8fb-dual-b70.patch` |
