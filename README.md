@@ -194,7 +194,7 @@ All speed claims compare **time per cycle at temperature 1.0, averaged over 6 fi
 
 ## License
 
-MIT (see `LICENSE`). The patch modifies llama.cpp, which is also MIT (© the ggml authors).
+MIT (see `LICENSE`). `patches/llama.cpp-d81d0d8fb-dual-b70.patch` modifies [llama.cpp](https://github.com/ggml-org/llama.cpp), which is also MIT-licensed (Copyright (c) 2023-2026 The ggml authors); the code it changes remains under that license.
 
 ## Caveats
 
