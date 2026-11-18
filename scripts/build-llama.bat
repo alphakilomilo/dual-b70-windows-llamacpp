@@ -30,4 +30,4 @@ cmake -B build -G Ninja ^
   -DLEVEL_ZERO_DEV_INCLUDE_DIR="%L0_SDK%\include" ^
   -DZE_LOADER_LIB="%L0_SDK%\lib\ze_loader.lib"
 if errorlevel 1 exit /b 1
-cmake --build build --config Release -j 8 --target llama-server
+cmake --build build --config Release -j 8 --target llama-server llama-quantize

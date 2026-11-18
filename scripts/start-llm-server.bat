@@ -1,5 +1,5 @@
 @echo off
-rem Qwen3.8-27B llama-server launcher for 2x Intel Arc Pro B70 (tensor parallel, DFlash2).
+rem Qwen3.8-27B llama-server launcher for 2x Intel Arc Pro B70 (tensor parallel, DSpine drafter, tree verification).
 rem Reads server flags from ..\config\llm-server.conf. Edit the paths below.
 setlocal enabledelayedexpansion
 
@@ -27,9 +27,12 @@ set "GGML_SYCL_ENABLE_MKL_FA=0"
 rem device-to-device copies through Level Zero (+5% decode measured)
 set "GGML_SYCL_DEV2DEV_MEMCPY=1"
 set "GGML_SYCL_USE_LEVEL_ZERO_API=1"
+rem SYCL graph replay for the draft context only (upstream #28725)
+set "GGML_SYCL_ENABLE_GRAPH=2"
+set "GGML_SYCL_GRAPH_MULTI_DEVICE=1"
 
-rem --- switches added by patches\llama.cpp-d81d0d8fb-dual-b70.patch ------------
-rem one SYCL context per GPU over one Level Zero context: works around a oneAPI 2026.1 leak
+rem --- switches added by patches\llama.cpp-9183a552e-dual-b70.patch ------------
+rem one SYCL context per GPU over one Level Zero context: works around a oneAPI leak
 rem (~0.5 MB per token with tensor parallel, see README). Keep this on.
 set "GGML_SYCL_PER_DEVICE_CONTEXT=1"
 rem tensor-parallel all-reduce: read the peer's pinned host buffer directly, join through
@@ -37,18 +40,33 @@ rem host-memory flags instead of a host wait, symmetric bf16 so both replicas st
 set "GGML_SYCL_TP_DIRECT=1"
 set "GGML_SYCL_TP_GPUFLAG=1"
 set "GGML_SYCL_TP_BF16_SYM=1"
-rem DFlash2 needs the full output head on each GPU under tensor parallel
+rem prefill all-reduce in 8 bits with a scale per 16 values (+12% prefill)
+set "GGML_SYCL_TP_Q8X=2"
+set "GGML_SYCL_TP_Q8X_BLOCK=16"
+rem fused ADD + RMS_NORM + MUL
+set "GGML_SYCL_ADD_RMS_FUSE=1"
+rem the drafter reuses the target's output head: keep the full head on each GPU
 set "LLAMA_TEST_DFLASH_TP_MIRROR_HEAD=1"
-rem XMX split-K flash attention for 1-8 query tokens (decode / speculative verify)
+rem XMX flash attention for decode and verify batches (1-24 query tokens)
 set "GGML_SYCL_FA_XMX=1"
-rem oneDNN SDPA for prefill, without a host wait after each call
+set "GGML_SYCL_FA_XMX_STREAM=1"
+set "GGML_SYCL_FA_XMX_NARROW_STREAM=1"
+set "GGML_SYCL_FA_XMX_NARROW_96=1"
+set "GGML_SYCL_FA_XMX_WIDE21_64=1"
+rem oneDNN SDPA for prefill and the vision encoder, without a host wait after each call
 set "GGML_SYCL_FA_ONEDNN=1"
 set "GGML_SYCL_FA_ONEDNN_SYNC=0"
-rem shared activation quantization for the paired Q8 FFN up/gate
-set "GGML_SYCL_Q8_GLU_FUSION=1"
-set "GGML_SYCL_Q8_GLU_SPLIT_EPILOGUE=1"
-rem do not feed the drafter prompt rows outside its 2048-token sliding window
+rem do not feed the drafter prompt rows outside its sliding window
 set "LLAMA_DFLASH_PREFILL_TAIL=1"
+rem drafter features through host copies (upstream's device-buffer path was slower under tensor parallel)
+set "LLAMA_DFLASH_DEV=0"
+rem 12-node draft tree, verified by sampling the target at each node (lossless at any temperature)
+set "LLAMA_SPEC_TREE=12"
+set "LLAMA_SPEC_TREE_MATCH=1"
+rem second cached target graph for verify batches of up to 16 tokens
+set "LLAMA_TARGET_DUAL_SCHED=16"
+rem top-20 logits per verify row on the GPU instead of copying full 248K-entry rows
+set "LLAMA_GPU_TOPK=20"
 
 if not exist "%LLAMA_BUILD%\llama-server.exe" (
     echo ERROR: llama-server.exe not found at "%LLAMA_BUILD%".
